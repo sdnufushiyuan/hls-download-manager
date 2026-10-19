@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hls-download-manager"
+version = "0.1.0"
+description = "Resumable HLS v2 OPTRAM archives with Linux cluster scheduling, progress estimates and adaptive proxy routing"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [{name = "sdnufushiyuan"}]
+dynamic = ["dependencies"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: GIS",
+]
+
+[project.urls]
+Repository = "https://github.com/sdnufushiyuan/hls-download-manager"
+Issues = "https://github.com/sdnufushiyuan/hls-download-manager/issues"
+
+[project.scripts]
+hls-download = "download_hls_optram:main"
+hls-archive = "run_hls_archive:main"
+hls-progress = "watch_hls_progress:main"
+hls-node-optimize = "hls_node_optimizer:main"
+
+[tool.setuptools]
+py-modules = [
+  "download_hls_optram", "hls_download_selection", "run_hls_cluster", "run_hls_node",
+  "run_hls_archive", "hls_progress_state", "hls_progress_rates", "watch_hls_progress",
+  "hls_node_optimizer", "hls_email_alert",
+]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}

@@ -1,0 +1,10 @@
+{
+  "regions": [
+    {"code": "SDR", "roi": "/opt/hls-download-manager/ROI/SDR/roi.shp", "crs": "EPSG:32650"},
+    {"code": "REM", "roi": "/opt/hls-download-manager/ROI/REM/roi.shp", "crs": "EPSG:32630"},
+    {"code": "MES", "roi": "/opt/hls-download-manager/ROI/MES/roi.shp", "crs": "EPSG:5070"},
+    {"code": "RIS", "roi": "/opt/hls-download-manager/ROI/RIS/roi.shp", "crs": "EPSG:32614"},
+    {"code": "OZN", "roi": "/opt/hls-download-manager/ROI/OZN/roi.shp", "crs": "EPSG:32755"},
+    {"code": "TXS", "roi": "/opt/hls-download-manager/ROI/TXS/roi.shp", "crs": "EPSG:32614"}
+  ]
+}

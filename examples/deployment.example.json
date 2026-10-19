@@ -1,0 +1,11 @@
+{
+  "ee_project": "your-earth-engine-project",
+  "run_root": "/opt/hls-download-manager/runs/archive",
+  "output_root": "/nasdata/HLS/archive",
+  "nas_source": "//nas.example.org/data",
+  "nodes": ["node1", "node2", "master"],
+  "workers": 4,
+  "mihomo_binary": "/opt/mihomo/mihomo",
+  "proxy_config": "/opt/hls-download-manager/private/mihomo.json",
+  "optimizer_config": "/opt/hls-download-manager/private/optimizer.json"
+}

@@ -1,0 +1,8 @@
+# Replace with your own independently usable Mihomo nodes. Never commit real values.
+proxies:
+  - name: example-node
+    type: ss
+    server: proxy.example.org
+    port: 443
+    cipher: aes-128-gcm
+    password: REPLACE_WITH_YOUR_NODE_PASSWORD

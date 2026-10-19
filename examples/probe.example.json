@@ -1,0 +1,8 @@
+{
+  "roi": "/opt/hls-download-manager/ROI/SDR/roi.shp",
+  "reference": "/opt/hls-download-manager/private/probe-reference.tif",
+  "scene_id": "NASA/HLS/HLSL30/v002/T50TMM_20240602T025757",
+  "sensor": "L30",
+  "reflectance_scale": 1.0,
+  "aerosol": "low"
+}
