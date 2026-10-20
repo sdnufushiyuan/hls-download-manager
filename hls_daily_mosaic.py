@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Stream completed HLS blocks into daily track/tile GeoTIFFs without resampling.
+"""Stream completed HLS blocks into daily regional GeoTIFFs without resampling.
 
-L30: UTC date + source Landsat WRS path/row. S30: UTC date + MGRS tile.
-Only catalog metadata is fetched; raster data comes from the existing archive.
+Default: region + UTC date + HLS product, crossing WRS/MGRS boundaries.
+Legacy track-day mode retains source WRS/MGRS grouping and metadata lookups.
 """
 from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import ExitStack
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -34,6 +35,9 @@ import run_hls_archive as archive
 import run_hls_cluster as cluster
 
 POLICY = 'daily-track-first-valid-whole-pixel-v1'
+REGION_POLICY = 'daily-region-first-valid-whole-pixel-v1'
+FUSION_POLICY = 'daily-region-l30-first-s30-fill-v1'
+TIME_NODATA = 4294967295
 MONTH_RE = re.compile(r'\d{4}-\d{2}-\d{2}__\d{4}-\d{2}-\d{2}')
 INDEX_RE = re.compile(r'T(\d{2}[A-Z]{3})_(\d{8})T\d{6}')
 PRODUCT_RE = re.compile(r'LC0[89]_L1[A-Z0-9]{2}_(\d{3})(\d{3})_(\d{8})_\d{8}_\d{2}_(?:T1|T2|RT)')
@@ -115,6 +119,14 @@ def identity(scene, metadata):
         raise MosaicError('One HLS asset contains multiple WRS path/rows; strict grouping needs source disambiguation')
     path, row = next(iter(keys))
     return 'L30', date, f'P{path}_R{row}'
+
+
+def regional_identity(scene):
+    match=INDEX_RE.fullmatch(scene['index'])
+    date=day(scene)
+    if not match or match[2]!=date or scene['sensor'] not in hls.SENSORS:
+        raise MosaicError('Invalid HLS acquisition identity')
+    return scene['sensor'],date,'REGION'
 
 
 class MetadataCache:
@@ -228,9 +240,13 @@ def load_month(directory, roi, payload, expected_count=None):
     return manifest, relevant, records, footprints, tiles
 
 
-def compose_window(inputs, geometry, tile, recipe_hash, crs, aerosol, validated, check=lambda: None):
+def compose_window(inputs, geometry, tile, recipe_hash, crs, aerosol, validated, check=lambda: None, *, trace=False):
     """One bounded six-band window; pick all bands from the same source pixel."""
     data = np.full((len(hls.BANDS), tile.height, tile.width), hls.NODATA, dtype='float32')
+    codes=np.zeros((tile.height,tile.width),dtype='uint8') if trace else None
+    times=np.full((tile.height,tile.width),TIME_NODATA,dtype='uint32') if trace else None
+    if not inputs:
+        return (data,0,codes,times) if trace else (data,0)
     occupied = np.zeros((tile.height, tile.width), dtype=bool)
     inside = geometry_mask([mapping(geometry)], out_shape=occupied.shape,
                            transform=Affine(*tile.transform), invert=True, all_touched=False)
@@ -248,14 +264,19 @@ def compose_window(inputs, geometry, tile, recipe_hash, crs, aerosol, validated,
                                 transform=Affine(*tile.transform),invert=True,all_touched=False)
         take = inside & allowed & ~occupied & np.all(values != hls.NODATA, axis=0)
         data[:, take] = values[:, take]
+        if trace:
+            codes[take]=1 if record['sensor']=='L30' else 2
+            times[take]=(record['time_ms']//1000)%86400
         occupied |= take
-    return data, int(occupied.sum())
+    result=(data,int(occupied.sum()))
+    return (*result,codes,times) if trace else result
 
 
 def write_group(output, key, scenes, donors, records, footprints, tiles, manifest, month_root,
-                metadata, check=lambda: None):
+                metadata, check=lambda: None, *, roi=None, policy=POLICY):
     sensor, date, spatial_id = key
-    geometry = unary_union([footprints[s['id']] for s in scenes])
+    fused=sensor=='FUSED'
+    geometry = roi if roi is not None else unary_union([footprints[s['id']] for s in scenes])
     selected = [tile for tile in tiles.values() if geometry.intersection(box(*tile.bounds)).area > 0]
     if not selected:
         return None
@@ -267,9 +288,10 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
     transform = Affine(30, 0, origin_left+min_col*30, 0, -30, origin_top-min_row*30)
     width, height = last_col-min_col, last_row-min_row
     source_rows, by_tile = [], defaultdict(list)
-    allowed = {stamp:unary_union([footprints[s['id']] for s in scenes if s['time_ms']==stamp])
-               for stamp in {s['time_ms'] for s in scenes}}
-    for scene in sorted(donors, key=lambda s: (s['time_ms'], s['id'])):
+    allowed = {obs:unary_union([footprints[s['id']] for s in scenes if (s['sensor'],s['time_ms'])==obs])
+               for obs in {(s['sensor'],s['time_ms']) for s in scenes}}
+    priority=lambda s:((0 if s['sensor']=='L30' else 1) if fused else 0,s['time_ms'],s['id'])
+    for scene in sorted(donors, key=priority):
         record = records[scene['id']]
         row = {'asset_id':scene['id'], 'time_ms':scene['time_ms'],
                'scene_record_sha256':hls.hash_object(record), 'blocks':[]}
@@ -285,10 +307,10 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
             if saved.get('scene_id') != scene['id'] or saved.get('recipe_hash') != manifest['recipe_hash']:
                 raise MosaicError('Block sidecar identity mismatch')
             row['blocks'].append({'file':str(path.relative_to(month_root)), 'sha256':saved['sha256']})
-            by_tile[(tile.row, tile.col)].append((path, record, allowed[scene['time_ms']]))
+            by_tile[(tile.row, tile.col)].append((path, record, allowed[(scene['sensor'],scene['time_ms'])]))
         if row['blocks']:
             source_rows.append(row)
-    contract = {'policy':POLICY, 'group':list(key), 'recipe_hash':manifest['recipe_hash'],
+    contract = {'policy':policy, 'group':list(key), 'recipe_hash':manifest['recipe_hash'],
         'target_assets':[s['id'] for s in sorted(scenes,key=lambda s:s['id'])],
         'source_blocks':source_rows, 'catalog':{s['id']:metadata[s['id']] for s in donors},
         'geometry_sha256':hls.hash_object(mapping(geometry)),
@@ -296,20 +318,41 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
         'bands':list(hls.BANDS),'nodata':hls.NODATA,
         'overlap_rule':'earliest UTC time, then asset ID; first valid complete six-band pixel',
         'dedup_recovery':'existing blocks from the same product and exact acquisition times, clipped to target footprints'}
+    if roi is not None:
+        contract['extent_rule']='fixed full regional ROI bounding grid; unobserved/invalid pixels remain NoData'
+    if fused:
+        contract['overlap_rule']='valid L30 first, then same-UTC-day valid S30; within product earliest time/asset ID; whole six-band pixel'
+        contract['physical_bands']={'L30':{'red':'B4','nir':'B5','swir2':'B7'},
+                                    'S30':{'red':'B4','nir':'B8A','swir2':'B12'}}
+        contract['fusion']='No averaging, interpolation or extra bandpass adjustment; existing strict QA/NoData requirements apply to both products'
     fingerprint = hls.hash_object(contract)
     output = Path(output)
     no_symlink(output)
     receipt = output.with_suffix('.json')
+    trace_paths={'source':output.with_name(output.stem+'_source.tif'),
+                 'time':output.with_name(output.stem+'_time_utc.tif')} if fused else {}
+    for path in trace_paths.values():no_symlink(path)
     if output.exists():
         saved = read_json(receipt)
         if saved.get('fingerprint') != fingerprint or saved.get('sha256') != hls.file_hash(output):
             raise MosaicError('Existing daily output differs; refusing overwrite: '+output.name)
+        if fused:
+            maps=saved.get('provenance_maps',{})
+            if set(maps)!=set(trace_paths) or any(
+                    maps[k].get('path')!=str(p) or not p.is_file() or maps[k].get('sha256')!=hls.file_hash(p)
+                    for k,p in trace_paths.items()):
+                raise MosaicError('Fused provenance maps are missing or changed')
         return {**saved, 'reused':True}
     if receipt.exists():
         raise MosaicError('Daily receipt exists without its TIFF; refusing silent repair')
+    if any(path.exists() for path in trace_paths.values()):
+        raise MosaicError('Provenance map exists without its verified fused TIFF')
     output.parent.mkdir(parents=True, exist_ok=True)
     no_symlink(output)
     temporary = output.with_name(output.name+'.'+uuid.uuid4().hex+'.part')
+    trace_temps={k:temporary.with_name(temporary.name+'.'+k) for k in trace_paths}
+    trace_hashes=[]
+    pixel_sources={'L30':0,'S30':0}
     valid_pixels, validated = 0, set()
     expected_hashes = []
     recipe = manifest['recipe']
@@ -318,10 +361,20 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
             with rasterio.open(temporary,'w',driver='GTiff',width=width,height=height,count=6,
                     dtype='float32',crs=recipe['crs'],transform=transform,nodata=hls.NODATA,
                     tiled=True,blockxsize=256,blockysize=256,compress='DEFLATE',predictor=3,
-                    BIGTIFF='IF_SAFER',NUM_THREADS='1') as destination:
+                    BIGTIFF='IF_SAFER',NUM_THREADS='1') as destination, ExitStack() as resources:
+                trace_outputs={}
+                for kind,path in trace_temps.items():
+                    layer=resources.enter_context(rasterio.open(path,'w',driver='GTiff',width=width,height=height,
+                        count=1,dtype='uint8' if kind=='source' else 'uint32',nodata=0 if kind=='source' else TIME_NODATA,
+                        crs=recipe['crs'],transform=transform,tiled=True,blockxsize=256,blockysize=256,
+                        compress='DEFLATE',BIGTIFF='IF_SAFER',NUM_THREADS='1'))
+                    layer.set_band_description(1,'source_product' if kind=='source' else 'observation_seconds_utc')
+                    layer.update_tags(fingerprint=fingerprint,date_utc=date,
+                        meaning='0=NoData,1=L30,2=S30' if kind=='source' else 'seconds since UTC midnight; 4294967295=NoData')
+                    trace_outputs[kind]=layer
                 for index, name in enumerate(hls.BANDS,1):
                     destination.set_band_description(index,name)
-                destination.update_tags(mosaic_policy=POLICY,fingerprint=fingerprint,product=sensor,
+                destination.update_tags(mosaic_policy=policy,fingerprint=fingerprint,product=sensor,
                     date_utc=date,spatial_id=spatial_id,recipe_hash=manifest['recipe_hash'],
                     resampling='none',temporal_averaging='none',aerosol=recipe['aerosol'])
                 for row in range(min_row,last_row,tile_size):
@@ -329,10 +382,19 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
                         check()
                         tile = hls.Tile(row,col,origin_left+col*30,origin_top-row*30,
                                         min(tile_size,last_col-col),min(tile_size,last_row-row))
-                        values, count = compose_window(by_tile[(row,col)],geometry,tile,
-                            manifest['recipe_hash'],recipe['crs'],recipe['aerosol'],validated,check)
+                        result=compose_window(by_tile[(row,col)],geometry,tile,
+                            manifest['recipe_hash'],recipe['crs'],recipe['aerosol'],validated,check,trace=fused)
+                        values,count=result[:2]
                         window = Window(col-min_col,row-min_row,tile.width,tile.height)
                         destination.write(values,window=window)
+                        if fused:
+                            codes,times=result[2:]
+                            trace_outputs['source'].write(codes,1,window=window)
+                            trace_outputs['time'].write(times,1,window=window)
+                            trace_hashes.append((window,hashlib.sha256(codes.tobytes()).hexdigest(),
+                                                  hashlib.sha256(times.tobytes()).hexdigest()))
+                            pixel_sources['L30']+=int(np.count_nonzero(codes==1))
+                            pixel_sources['S30']+=int(np.count_nonzero(codes==2))
                         expected_hashes.append((window,hashlib.sha256(values.tobytes()).hexdigest()))
                         valid_pixels += count
             # Read the entire output in bounded windows; exact bytes include NoData.
@@ -345,39 +407,67 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
                     check()
                     if hashlib.sha256(result.read(window=window).tobytes()).hexdigest()!=digest:
                         raise MosaicError('Daily TIFF pixel verification failed')
+            if fused:
+                with rasterio.open(trace_temps['source']) as codes,rasterio.open(trace_temps['time']) as times:
+                    for window,code_hash,time_hash in trace_hashes:
+                        check()
+                        if (hashlib.sha256(codes.read(1,window=window).tobytes()).hexdigest()!=code_hash or
+                                hashlib.sha256(times.read(1,window=window).tobytes()).hexdigest()!=time_hash):
+                            raise MosaicError('Fused provenance pixel verification failed')
         check()
         digest = hls.file_hash(temporary)
         saved = {'fingerprint':fingerprint,'sha256':digest,'contract':contract,
                  'valid_pixels':valid_pixels,'verified_utc':datetime.now(timezone.utc).isoformat(),
                  'rasterio_version':rasterio.__version__,'gdal_version':rasterio.__gdal_version__,
                  'bytes':temporary.stat().st_size,'path':str(output)}
+        if fused:
+            saved['source_pixels']=pixel_sources
+            saved['provenance_maps']={k:{'path':str(trace_paths[k]),'sha256':hls.file_hash(p)} for k,p in trace_temps.items()}
         # A crash between these two commits leaves a TIFF without a receipt;
         # the next run stops rather than treating it as a verified deliverable.
         os.replace(temporary,output)
+        for kind,path in trace_temps.items():os.replace(path,trace_paths[kind])
         atomic_json(receipt,saved)
         return {**saved,'reused':False}
     finally:
         temporary.unlink(missing_ok=True)
+        for path in trace_temps.values():path.unlink(missing_ok=True)
 
 
 def process_month(directory, region, roi, payload, metadata_cache, output_root,
-                  expected_count=None, check=lambda:None, emit=print):
+                  expected_count=None, check=lambda:None, emit=print, *, grouping='track-day',fuse_products=False):
+    if grouping not in ('region-day','track-day'):
+        raise MosaicError('Unknown daily grouping')
+    regional=grouping=='region-day'
+    if fuse_products and not regional:raise MosaicError('Product fusion requires region-day grouping')
     manifest, scenes, records, footprints, tiles = load_month(directory,roi,payload,expected_count)
-    metadata = metadata_cache.load(scenes)
+    if regional:
+        # Frozen indices/timestamps are sufficient for date+product grouping.
+        # No WRS lookup, EE initialization or network request is needed.
+        metadata={scene['id']:{'system:time_start':scene['time_ms'],
+                  'MGRS_TILE_ID':INDEX_RE.fullmatch(scene['index'])[1],
+                  'origin':'frozen archive manifest and HLS index'} for scene in scenes}
+    else:
+        metadata = metadata_cache.load(scenes)
     groups, observations = defaultdict(list), defaultdict(list)
     for scene in scenes:
-        groups[identity(scene,metadata[scene['id']])].append(scene)
+        key=regional_identity(scene) if regional else identity(scene,metadata[scene['id']])
+        groups[key].append(scene)
         observations[(scene['sensor'],scene['time_ms'])].append(scene)
+        if fuse_products:groups[('FUSED',day(scene),'REGION')].append(scene)
     results = []
     for key, members in sorted(groups.items()):
         check()
         donors = {s['id']:s for member in members
                   for s in observations[(member['sensor'],member['time_ms'])]
-                  if key[0]=='S30' or identity(s,metadata[s['id']])==key}
+                  if regional or key[0]=='S30' or identity(s,metadata[s['id']])==key}
         sensor,date,spatial_id = key
-        output = Path(output_root)/region/sensor/date[:4]/f'{region}_{sensor}_{date}_{spatial_id}.tif'
+        suffix='' if regional else '_'+spatial_id
+        output = Path(output_root)/region/sensor/date[:4]/f'{region}_{sensor}_{date}{suffix}.tif'
         result = write_group(output,key,members,list(donors.values()),records,footprints,
-                             tiles,manifest,Path(directory),metadata,check)
+                             tiles,manifest,Path(directory),metadata,check,
+                             roi=roi if regional else None,
+                             policy=FUSION_POLICY if sensor=='FUSED' else REGION_POLICY if regional else POLICY)
         if result:
             results.append(result)
             emit(f"日景{'复用' if result['reused'] else '完成'} {output.name}；有效像元 {result['valid_pixels']:,}")
@@ -396,6 +486,9 @@ def parser():
     result.add_argument('--regions',nargs='+',choices=archive.REGION_CODES,default=list(archive.REGION_CODES))
     result.add_argument('--month',help='Optional YYYY-MM-DD__YYYY-MM-DD subset for a first sample')
     result.add_argument('--project')
+    result.add_argument('--grouping',choices=('region-day','track-day'),default='region-day',
+                        help='Default: one fixed-extent regional TIFF per UTC day and product; legacy track-day is opt-in')
+    result.add_argument('--fuse-products',action='store_true',help='Also create L30-first, same-day S30-fill regional TIFFs plus pixel source/time maps')
     result.add_argument('--proxy',default='http://127.0.0.1:8118')
     result.add_argument('--nas-source',required=True,help='Expected CIFS source; verify before reading/writing NAS')
     result.add_argument('--reserve-gib',type=float,default=256)
@@ -407,6 +500,7 @@ def parser():
 
 def main(argv=None):
     args=parser().parse_args(argv)
+    if args.fuse_products and args.grouping!='region-day':raise SystemExit('Fusion requires --grouping region-day')
     if (args.month and not MONTH_RE.fullmatch(args.month)) or not 30<=args.interval<=86400:
         raise SystemExit('Invalid month or polling interval')
     if not math.isfinite(args.reserve_gib) or args.reserve_gib<1:
@@ -420,12 +514,13 @@ def main(argv=None):
     if args.state_root.resolve()==source or source in args.state_root.resolve().parents:
         raise SystemExit('State/catalog cache must be outside the source archive')
     inventory=archive.read_inventory(str(args.inventory))
+    policy=FUSION_POLICY if args.fuse_products else REGION_POLICY if args.grouping=='region-day' else POLICY
     regions=sorted((r for r in inventory.regions if r.code in args.regions),key=lambda r:(r.area_m2,r.code))
     jobs=[(region,month) for region in regions for month in region.months if month.scene_count and
           (args.month is None or f'{month.start}__{month.end}'==args.month)]
-    print(json.dumps({'policy':POLICY,'source_root':str(source),'output_root':str(output),
+    print(json.dumps({'policy':policy,'source_root':str(source),'output_root':str(output),
                       'region_order':[r.code for r in regions],'months':len(jobs),
-                      'grouping':'L30 UTC date+WRS path/row; S30 UTC date+MGRS; separate products',
+                      'grouping':args.grouping,'fuse_products':args.fuse_products,
                       'mode':'run' if args.run else 'plan'},ensure_ascii=False),flush=True)
     if not args.run:
         return 0
@@ -470,7 +565,7 @@ def main(argv=None):
                     receipt=args.state_root/'months'/region.code/(name+'.json')
                     if receipt.exists():
                         saved=read_json(receipt)
-                        if (saved.get('policy')!=POLICY or saved.get('output_root')!=str(output) or
+                        if (saved.get('policy')!=policy or saved.get('output_root')!=str(output) or
                                 saved.get('manifest_sha256')!=hls.file_hash(directory/'run_manifest.json')):
                             raise MosaicError('Completed month receipt conflicts with source/output')
                         completed.append({'region':region.code,**saved})
@@ -481,8 +576,9 @@ def main(argv=None):
                             geometry_cache[region.code]=(roi,payload)
                         roi,payload=geometry_cache[region.code]
                         result=process_month(directory,region.code,roi,payload,cache,output,month.scene_count,check,
-                                             lambda value:print(value,flush=True))
-                        result.update(policy=POLICY,output_root=str(output))
+                                             lambda value:print(value,flush=True),grouping=args.grouping,
+                                             fuse_products=args.fuse_products)
+                        result.update(policy=policy,output_root=str(output))
                         atomic_json(receipt,result)
                         completed.append({'region':region.code,**result})
                     except MonthPending:
@@ -493,13 +589,13 @@ def main(argv=None):
                         print(f'日景暂未交付 {region.code}/{name}：{failed[-1]["reason"]}',flush=True)
                         if isinstance(error,CatalogUnavailable):
                             break  # One failed metadata batch per poll; no request storm.
-                    summary={'policy':POLICY,'updated_utc':datetime.now(timezone.utc).isoformat(),
+                    summary={'policy':policy,'updated_utc':datetime.now(timezone.utc).isoformat(),
                              'output_root':str(output),'total_months':len(jobs),'completed_months':len(completed),
                              'groups':sum(row['groups'] for row in completed),
                              'pending_months':len(jobs)-len(completed)-len(failed),
                              'blocked_months':failed,'active_region':region.code,'active_month':name}
                     atomic_json(args.state_root/'status.json',summary)
-                summary={'policy':POLICY,'updated_utc':datetime.now(timezone.utc).isoformat(),
+                summary={'policy':policy,'updated_utc':datetime.now(timezone.utc).isoformat(),
                          'output_root':str(output),'total_months':len(jobs),'completed_months':len(completed),
                          'groups':sum(row['groups'] for row in completed),
                          'pending_months':len(jobs)-len(completed)-len(failed),

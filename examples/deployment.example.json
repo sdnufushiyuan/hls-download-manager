@@ -7,8 +7,10 @@
   "workers": 4,
   "schedule": "smallest-first",
   "daily_mosaic": {
-    "output_root": "/nasdata/HLS/daily-by-track",
-    "state_root": "/opt/hls-download-manager/runs/daily-mosaic",
+    "grouping": "region-day",
+    "fuse_products": true,
+    "output_root": "/nasdata/HLS/daily-by-region",
+    "state_root": "/opt/hls-download-manager/runs/daily-region-mosaic",
     "interval": 300
   },
   "mihomo_binary": "/opt/mihomo/mihomo",

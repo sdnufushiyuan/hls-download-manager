@@ -66,9 +66,93 @@ class MosaicTests(unittest.TestCase):
     def save_manifest(self):
         m.atomic_json(self.month/'run_manifest.json',{'recipe':self.recipe,'recipe_hash':self.fingerprint,'scenes':self.scenes})
 
-    def process(self):
+    def process(self,grouping='track-day',fuse_products=False):
         cache=Mock();cache.load.side_effect=lambda scenes:{s['id']:self.metadata[s['id']] for s in scenes}
-        return m.process_month(self.month,'RIS',self.roi,self.payload,cache,self.root/'daily',len(self.scenes),emit=lambda _:None)
+        if grouping=='region-day':cache.load.side_effect=AssertionError('Regional mode must not query EE metadata')
+        return m.process_month(self.month,'RIS',self.roi,self.payload,cache,self.root/'daily',len(self.scenes),
+                               emit=lambda _:None,grouping=grouping,fuse_products=fuse_products)
+
+    def test_regional_day_crosses_wrs_and_mgrs_and_does_not_query_ee(self):
+        self.add(blocks=[0],footprint=box(0,0,1920,1920))
+        second=self.add('14UNV',blocks=[1],pathrow='031026',footprint=box(1920,0,3840,1920),value=.2)
+        self.metadata[second['id']]={}  # Source WRS is irrelevant to regional day grouping.
+        result=self.process('region-day')
+        self.assertEqual(result['groups'],1)
+        path=Path(result['outputs'][0]['path'])
+        self.assertEqual(path.name,'RIS_L30_20130428.tif')
+        with rasterio.open(path) as src:
+            self.assertEqual((src.width,src.height),(128,64))
+            self.assertAlmostEqual(float(src.read(1)[1,1]),.1,6)
+            self.assertAlmostEqual(float(src.read(1)[1,65]),.2,6)
+
+    def test_regional_grid_is_identical_across_dates_and_products_with_holes(self):
+        self.add(blocks=[0],footprint=box(0,0,1920,1920))
+        self.add(sensor='S30',blocks=[1],footprint=box(1920,0,3840,1920),value=.2)
+        self.add(stamp='20130429T173005',blocks=[1],footprint=box(1920,0,3840,1920))
+        result=self.process('region-day');self.assertEqual(result['groups'],3)
+        grids=[]
+        for row in result['outputs']:
+            with rasterio.open(row['path']) as src:
+                grids.append((src.width,src.height,src.transform,src.crs))
+                self.assertEqual((src.width,src.height),(128,64))
+                if Path(row['path']).name=='RIS_L30_20130428.tif':
+                    self.assertTrue(np.all(src.read()[:,:,64:]==h.NODATA))
+        self.assertEqual(len(set(grids)),1)
+
+    def test_fusion_prioritizes_l30_even_when_s30_is_earlier_and_fills_holes(self):
+        self.add(blocks=[0],value=.1)
+        self.add(sensor='S30',stamp='20130428T170000',blocks=[0,1],value=.3)
+        result=self.process('region-day',True)
+        self.assertEqual(result['groups'],3)  # Keep both original product day images as well.
+        row=next(v for v in result['outputs'] if '/FUSED/' in v['path'].replace('\\','/'))
+        saved=m.read_json(Path(row['path']).with_suffix('.json'))
+        with rasterio.open(row['path']) as src:
+            values=src.read()
+            self.assertEqual(src.descriptions,h.BANDS)
+            self.assertAlmostEqual(float(values[0,1,1]),.1,6)
+            self.assertAlmostEqual(float(values[0,1,65]),.3,6)
+            self.assertAlmostEqual(float(values[4,1,65]),float((1-.5)**2/(2*.5)),6)
+        with rasterio.open(saved['provenance_maps']['source']['path']) as src:
+            codes=src.read(1)
+            self.assertEqual((int(codes[1,1]),int(codes[1,65]),int(codes[0,0])),(1,2,0))
+        with rasterio.open(saved['provenance_maps']['time']['path']) as src:
+            times=src.read(1)
+            self.assertEqual(int(times[1,1]),17*3600+30*60+5)
+            self.assertEqual(int(times[1,65]),17*3600)
+            self.assertEqual(int(times[0,0]),m.TIME_NODATA)
+        self.assertEqual(saved['source_pixels'],{'L30':4095,'S30':4095})
+        self.assertEqual(self.process('region-day',True)['groups'],3)
+
+    def test_fusion_does_not_fill_from_another_day_and_handles_s30_only(self):
+        self.add(blocks=[0])
+        self.add(sensor='S30',stamp='20130429T170000',blocks=[1],value=.3)
+        result=self.process('region-day',True)
+        fused=[v for v in result['outputs'] if '/FUSED/' in v['path'].replace('\\','/')]
+        self.assertEqual(len(fused),2)
+        for row in fused:
+            saved=m.read_json(Path(row['path']).with_suffix('.json'))
+            if '20130428' in row['path']:
+                self.assertEqual(saved['source_pixels'],{'L30':4095,'S30':0})
+            else:self.assertEqual(saved['source_pixels'],{'L30':0,'S30':4095})
+
+    def test_fusion_requires_valid_source_qa_and_detects_changed_provenance(self):
+        scene=self.add(sensor='S30',blocks=[0])
+        result=self.process('region-day',True)
+        fused=next(v for v in result['outputs'] if '/FUSED/' in v['path'].replace('\\','/'))
+        saved=m.read_json(Path(fused['path']).with_suffix('.json'))
+        source=Path(saved['provenance_maps']['source']['path'])
+        source.write_bytes(source.read_bytes()+b'tamper')
+        with self.assertRaises(m.MosaicError):self.process('region-day',True)
+
+    def test_invalid_s30_qa_is_never_used_for_fusion(self):
+        scene=self.add(sensor='S30',blocks=[0])
+        block=self.month/'S30'/scene['index']/self.tiles[0].name
+        with rasterio.open(block,'r+') as src:
+            data=src.read();data[5,1,1]=66;src.write(data)
+        saved=m.read_json(block.with_suffix('.json'));saved['sha256']=h.file_hash(block)
+        m.atomic_json(block.with_suffix('.json'),saved)
+        with self.assertRaises(m.MosaicError):self.process('region-day',True)
+        self.assertFalse(list((self.root/'daily').rglob('*.tif')))
 
     def test_same_wrs_day_merges_two_hls_tiles_and_preserves_values(self):
         self.add(blocks=[0],footprint=box(0,0,1920,1920))

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Default daily mosaics to full-region, fixed-grid UTC-day images across HLS tiles, keeping L30/S30 separate without metadata network requests.
+- Add optional same-day L30-first/S30-fill fusion with whole six-band pixels and verified source/acquisition-time rasters.
+
 - Add windowed, verified daily GeoTIFF generation: L30 by UTC date/WRS path-row and S30 by UTC date/MGRS tile.
 - Add provenance metadata caching, same-observation dedup recovery and an optional low-priority mosaic service.
 

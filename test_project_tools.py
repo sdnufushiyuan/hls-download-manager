@@ -40,6 +40,9 @@ class ProjectToolsTests(unittest.TestCase):
         self.assertIn('hls_daily_mosaic.py',daily)
         self.assertIn('MemoryMax=512M',daily)
         self.assertIn('CPUQuota=50%',daily)
+        self.assertIn('"--grouping" "region-day"',daily)
+        self.assertIn('"--fuse-products"',daily)
+        with self.assertRaises(ValueError):render(dict(config,daily_mosaic=dict(config['daily_mosaic'],grouping='track-day')),root)
         with self.assertRaises(ValueError):render(dict(config,daily_mosaic={'output_root':config['output_root'],'state_root':'/opt/state'}),root)
         with self.assertRaises(ValueError):render(dict(config,output_root='/tmp/unverified'),root)
 
