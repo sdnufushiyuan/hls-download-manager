@@ -22,3 +22,15 @@ cp examples/auto-daily.example.json private/auto-daily.local.json
 这里从Earth Engine仅取小块原始QA，完整时序判别和日图计算在本地进行。小块传输采用[官方getDownloadURL接口](https://developers.google.com/earth-engine/apidocs/ee-image-getdownloadurl)，不提交大范围交互计算；不使用bestEffort或隐式尺度。源资产ID、ROI/源清单SHA、精确CRS/transform、尺寸、客户端版本、采集时间记录在本地收据中，签名下载URL不落盘、不打印。资产不可用、配额或认证失败会阻塞该区，保留进度重试。
 
 状态保存在`state_root/status.json`，完整区域收据在`state_root/REGION/completed.json`。当所有区域交付完毕程序正常退出。通过systemd运行时使用`Restart=on-failure`，不会在全部成功后反复重启。
+
+## 明确排除不需要的月份
+
+用户决定舍弃某个整月/末月分片时，在私有自动配置加入例如：
+
+```json
+"excluded_months": [
+  {"month": "RIS/2026-10-01__2026-10-10", "reason": "User explicitly omitted this final partial month"}
+]
+```
+
+边界必须精确匹配原冻结库存。排除项同步用于区域完成判断、完整QA历史及正式日图，其他区域保持原范围；范围和理由写入QA历史与完成收据。原始库存、源文件及原有下载进度保留，排除不代表这些影像已下载完成，也不伪造场景完成记录。该示例使RIS研究时段截止2026-09-30，水体历史判定也仅使用保留时段。独立日图CLI对应参数为`--exclude-month RIS/2026-10-01__2026-10-10`。

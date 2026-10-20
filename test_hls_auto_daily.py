@@ -13,6 +13,41 @@ import run_hls_archive as archive
 
 
 class AutoDailyTests(unittest.TestCase):
+    def test_explicit_last_month_exclusion_preserves_original_and_other_regions(self):
+        sept=archive.Month(date(2026,9,1),date(2026,10,1),5)
+        october=archive.Month(date(2026,10,1),date(2026,10,10),10)
+        ris=archive.Region('RIS','/r.shp','EPSG:32614',1,(sept,october))
+        txs=archive.Region('TXS','/t.shp','EPSG:32614',2,(sept,october))
+        inventory=archive.Inventory(date(2026,9,1),date(2026,10,10),(ris,txs))
+        scoped=auto.m.scope_inventory(inventory,['RIS/2026-10-01__2026-10-10'])
+        self.assertEqual(scoped.regions[0].months,(sept,))
+        self.assertEqual(scoped.regions[1],txs)
+        self.assertEqual(inventory.regions[0].months,(sept,october))
+        for keys in [['RIS/2026-10-01__2026-10-09'],['BAD/2026-10-01__2026-10-10'],
+                     ['RIS/2026-09-01__2026-10-01','RIS/2026-10-01__2026-10-10']]:
+            with self.assertRaises(ValueError):auto.m.scope_inventory(inventory,keys)
+
+    def test_exclusion_needs_auditable_reason(self):
+        self.assertEqual(auto.exclusion_keys({}),[])
+        with self.assertRaises(ValueError):auto.exclusion_keys({'excluded_months':[{'month':'RIS/x'}]})
+        self.assertEqual(auto.exclusion_keys({'excluded_months':[{'month':'RIS/x','reason':'user omitted'}]}),['RIS/x'])
+
+    def test_readiness_and_qa_use_identical_authorized_scope(self):
+        sept=archive.Month(date(2026,9,1),date(2026,10,1),5)
+        october=archive.Month(date(2026,10,1),date(2026,10,10),10)
+        region=archive.Region('RIS','/r.shp','EPSG:32614',1,(sept,october))
+        inventory=archive.Inventory(date(2026,9,1),date(2026,10,10),(region,))
+        config={'excluded_months':[{'month':'RIS/2026-10-01__2026-10-10','reason':'user request'}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);source=root/'inventory.json';source.write_text('{}')
+            paths=dict(inventory=source,state_root=root/'state',source_root=root/'archive')
+            with patch.object(auto.a,'read_inventory',return_value=inventory), \
+                    patch.object(auto,'region_ready',return_value=(True,None)) as gate, \
+                    patch.object(auto,'prepare_history',side_effect=ValueError('stop before network')) as prepare:
+                auto.run_cycle(config,paths,lambda:None,lambda *args,**kw:None)
+            self.assertEqual(gate.call_args.args[1].months,(sept,))
+            self.assertEqual(prepare.call_args.args[0].months,(sept,))
+
     def test_completion_requires_regular_block_and_sidecar(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);directory=root/'L30'/'example';directory.mkdir(parents=True)

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Support explicit, reasoned per-region month exclusions consistently across download-readiness checks, original-QA history and daily output; preserve the original frozen inventory and source data.
+
 - Add a resumable per-region supervisor: verify a complete region, acquire original daily Fmask in serial fixed-grid chunks, build its complete-history water mask, and deliver L30/S30/FUSED without waiting for other regions.
 - Isolate regional failures, preserve frozen source inventory, bind completed-region receipts to sources/history, and provide an optional systemd user service.
 

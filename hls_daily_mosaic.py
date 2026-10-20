@@ -10,6 +10,7 @@ import argparse
 from collections import defaultdict
 from contextlib import ExitStack
 from datetime import datetime, timezone
+from dataclasses import replace
 import hashlib
 import json
 import math
@@ -523,6 +524,8 @@ def parser():
                         help='Use product-region for sibling L30/S30/FUSED folders, each containing region/year')
     result.add_argument('--require-network-complete',action='store_true',
                         help='Wait for the entire frozen inventory before processing any region/month')
+    result.add_argument('--exclude-month',action='append',default=[],metavar='REGION/START__END',
+                        help='Explicitly omit a frozen month from this processing scope; source inventory stays unchanged')
     result.add_argument('--water-mask-root',type=Path,help='Require verified REGION/water_history.tif masks before processing')
     result.add_argument('--proxy',default='http://127.0.0.1:8118')
     result.add_argument('--nas-source',required=True,help='Expected CIFS source; verify before reading/writing NAS')
@@ -531,6 +534,24 @@ def parser():
     result.add_argument('--watch',action='store_true',help='Poll newly completed months; keep verified month receipts')
     result.add_argument('--run',action='store_true',help='Default is an inventory-only plan with no writes/network')
     return result
+
+
+def scope_inventory(inventory,exclusions):
+    """Apply explicit scope exclusions, without treating omitted data as downloaded."""
+    if (not isinstance(exclusions,list) or any(not isinstance(key,str) for key in exclusions)
+            or len(set(exclusions))!=len(exclusions)):
+        raise ValueError('Month exclusions must be a unique list')
+    if not exclusions:return inventory
+    known={f'{region.code}/{month.start}__{month.end}' for region in inventory.regions for month in region.months}
+    if any(not isinstance(key,str) or key not in known for key in exclusions):
+        raise ValueError('Month exclusion does not match a frozen inventory boundary')
+    regions=[]
+    for region in inventory.regions:
+        months=tuple(month for month in region.months if f'{region.code}/{month.start}__{month.end}' not in exclusions)
+        if len(months)!=len(region.months) and not any(month.scene_count for month in months):
+            raise ValueError('Exclusions leave a region without any nonempty month')
+        regions.append(replace(region,months=months))
+    return replace(inventory,regions=tuple(regions))
 
 
 def committed_blocks_exist(directory,scenes,records,check=lambda:None):
@@ -591,7 +612,7 @@ def main(argv=None):
         raise SystemExit('Use separate non-nested archive/daily directories below /nasdata')
     if args.state_root.resolve()==source or source in args.state_root.resolve().parents:
         raise SystemExit('State/catalog cache must be outside the source archive')
-    inventory=archive.read_inventory(str(args.inventory))
+    inventory=scope_inventory(archive.read_inventory(str(args.inventory)),args.exclude_month)
     policy=FUSION_POLICY if args.fuse_products else REGION_POLICY if args.grouping=='region-day' else POLICY
     regions=sorted((r for r in inventory.regions if r.code in args.regions),key=lambda r:(r.area_m2,r.code))
     jobs=[(region,month) for region in regions for month in region.months if month.scene_count and
@@ -599,7 +620,7 @@ def main(argv=None):
     print(json.dumps({'policy':policy,'source_root':str(source),'output_root':str(output),
                       'region_order':[r.code for r in regions],'months':len(jobs),
                       'grouping':args.grouping,'fuse_products':args.fuse_products,'layout':args.layout,
-                      'mode':'run' if args.run else 'plan'},ensure_ascii=False),flush=True)
+                      'excluded_months':args.exclude_month,'mode':'run' if args.run else 'plan'},ensure_ascii=False),flush=True)
     if not args.run:
         return 0
     cluster.require_master()

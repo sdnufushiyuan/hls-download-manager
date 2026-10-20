@@ -58,7 +58,21 @@ def validate_config(config):
         raise ValueError('Polling interval must be 60..86400 seconds')
     if not config.get('nas_source'):
         raise ValueError('Verified NAS source required')
+    exclusion_keys(config)
     return paths
+
+
+def exclusion_keys(config):
+    records=config.get('excluded_months',[])
+    if not isinstance(records,list):raise ValueError('excluded_months must be an explicit list')
+    keys=[]
+    for row in records:
+        if (not isinstance(row,dict) or not isinstance(row.get('month'),str) or
+                not isinstance(row.get('reason'),str) or not row['reason'].strip()):
+            raise ValueError('Each excluded month needs a frozen month key and an explicit reason')
+        keys.append(row['month'])
+    if len(keys)!=len(set(keys)):raise ValueError('Duplicate month exclusion')
+    return keys
 
 
 def region_ready(inventory, region, source, check):
@@ -223,6 +237,8 @@ def prepare_history(region, config, paths, check, progress):
     contract = {'policy': POLICY, 'region': region.code, 'sources': sources,
                 'inventory_sha256': h.file_hash(paths['inventory']), 'crs': str(crs),
                 'grid': [grid[0], grid[1], *list(grid[2])[:6]], 'roi_sha256': h.hash_object(mapping(roi))}
+    omitted=[row for row in config.get('excluded_months',[]) if row['month'].startswith(region.code+'/')]
+    if omitted:contract['authorized_scope_exclusions']=omitted
     grouped = defaultdict(list)
     for scene in scenes:
         grouped[(m.day(scene), scene['sensor'])].append(scene)
@@ -279,7 +295,9 @@ def prepare_history(region, config, paths, check, progress):
 
 def run_cycle(config, paths, check, progress):
     inventory_sha = h.file_hash(paths['inventory'])
+    exclusions=exclusion_keys(config)
     inventory = a.read_inventory(str(paths['inventory']))
+    if exclusions:inventory=m.scope_inventory(inventory,exclusions)
     results = {}
     for region in sorted(inventory.regions, key=lambda r: (r.area_m2, r.code)):
         check()
@@ -296,7 +314,8 @@ def run_cycle(config, paths, check, progress):
                 verify_mask(Path(saved['mask']), saved['result']['history_sha256'])
                 results[region.code] = saved['result']
                 continue
-            progress('checking-region-download', region=region.code, regions=results)
+            omitted=[row for row in config.get('excluded_months',[]) if row['month'].startswith(region.code+'/')]
+            progress('checking-region-download', region=region.code, regions=results,excluded_months=omitted)
             ready, waiting = region_ready(inventory, region, paths['source_root'], check)
             if not ready:
                 results[region.code] = {'phase': 'waiting-for-region-download', 'waiting_for': waiting}
@@ -312,6 +331,7 @@ def run_cycle(config, paths, check, progress):
                     '--nas-source', config['nas_source'], '--regions', region.code,
                     '--layout', 'product-region', '--grouping', 'region-day', '--fuse-products',
                     '--water-mask-root', str(paths['water_root']), '--run']
+            for key in exclusions:args.extend(['--exclude-month',key])
             code = subprocess.run([sys.executable, str(Path(__file__).with_name('hls_daily_mosaic.py')), *args],
                                   check=False).returncode
             check()
@@ -323,6 +343,7 @@ def run_cycle(config, paths, check, progress):
                 raise ValueError('No fully committed regional daily completion receipt')
             results[region.code] = {'phase': 'completed', 'history_sha256': history_sha,
                                     'mask_sha256': h.file_hash(mask), 'daily_state': str(state)}
+            if omitted:results[region.code]['authorized_scope_exclusions']=omitted
             history = m.read_json(paths['state_root'] / region.code / 'original_qa_history.json')
             m.atomic_json(completion, {'policy': POLICY, 'config_sha256': h.hash_object(config),
                 'inventory_sha256': inventory_sha, 'source_manifests': history['complete_region_history']['sources'],
