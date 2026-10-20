@@ -31,7 +31,9 @@ def render(config, root):
     common=f'WorkingDirectory={directory}\nEnvironmentFile={word(environment)}\nNice=10\nUMask=0077\n'
     archive_args=[python,'-u',root/'run_hls_archive.py','--inventory',run/'inventory.json','--out',config['output_root'],
                   '--mount-source',config['nas_source'],'--nodes',*config.get('nodes',['node1','node2','master']),
-                  '--workers',str(config.get('workers',4)),'--resume-pending-first','--run']
+                  '--workers',str(config.get('workers',4)),'--schedule',config.get('schedule','smallest-first'),
+                  '--resume-pending-first','--run']
+    if config.get('schedule','smallest-first') not in ('fair','smallest-first'):raise ValueError('Unknown schedule')
     if not set(config.get('nodes',['node1','node2','master'])).issubset({'node1','node2','master'}):raise ValueError('Unknown node role')
     if type(config.get('workers',4)) is not int or not 1<=config.get('workers',4)<=8:raise ValueError('Workers must be 1–8')
     return {

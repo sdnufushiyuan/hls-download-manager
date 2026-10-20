@@ -5,6 +5,8 @@
 
 基于 Google Earth Engine 的 HLS v2 下载与运行管理工具：按景保存 OPTRAM 输入，支持校验后断点续传、Linux 多节点调度、实时下载速度与工期估算，以及代理故障回退和保守的自动选路。
 
+部署配置默认按估计剩余体量从小到大集中下载研究区，三个节点共同推进同一区的不同月份；该区全部月份通过核验后，再开始下一区。面板显示“已完成，可后续处理”后即可单独处理该区，无需等待六区全部结束。已有文件继续校验复用。
+
 English: resumable HLS v2 OPTRAM archives, Linux cluster scheduling, verified tile downloads, live progress estimates, and adaptive proxy routing. Deployment instructions are currently in Chinese.
 
 ## 功能

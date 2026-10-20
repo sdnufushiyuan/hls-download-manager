@@ -33,6 +33,9 @@ class ProjectToolsTests(unittest.TestCase):
         self.assertIn('RestartPreventExitStatus=1',units['hls-archive.service'])
         self.assertTrue(all('ConditionHost=master' in unit for unit in units.values()))
         self.assertIn('--workers" "4"',units['hls-archive.service'])
+        self.assertIn('--schedule" "smallest-first"',units['hls-archive.service'])
+        self.assertIn('--schedule" "fair"',render(dict(config,schedule='fair'),root)['hls-archive.service'])
+        with self.assertRaises(ValueError):render(dict(config,schedule='unknown'),root)
         with self.assertRaises(ValueError):render(dict(config,output_root='/tmp/unverified'),root)
 
     def test_unit_values_reject_control_characters_and_escape_percent(self):

@@ -183,6 +183,8 @@ def parser():
                         help="每节点同时下载的块数，1–8；不改变科学参数或缓存标识")
     result.add_argument("--resume-pending-first", action="store_true",
                         help="先运行未完成月份；已完成提示仅用于排序，所有月份仍保留并核验")
+    result.add_argument("--schedule", choices=("fair", "smallest-first"), default="fair",
+                        help="smallest-first：按剩余候选数×面积估计体量，集中完成并核验一个区再进入下一区")
     result.add_argument("--max-scenes", type=int, help="默认至少1000，并按库存最大月数量增加10%%+10保护余量")
     result.add_argument("--limit", type=int, help="仅试取时使用：每区域每月前 N 景，非全局限额")
     result.add_argument("--network-job-retries", type=int, choices=range(9), default=4,
@@ -227,14 +229,9 @@ def fair_jobs(inventory, out):
     return jobs
 
 
-def prioritize_pending_jobs(jobs):
-    """Use bounded completion hints for order only; never drop or trust a job.
-
-    Per-month pixel selection is independent. Both stable partitions preserve
-    the fair queue order, and every hinted-complete month still runs the normal
-    cache/recipe checks later. Missing, malformed or stale hints cannot skip data.
-    """
-    def looks_complete(job):
+def processed_scene_hint(job):
+    """Bounded scheduling hint only; every job must still validate its cache."""
+    def read_hint():
         directory = Path(job.out)
         path = directory / "download_selection_summary.json"
         try:
@@ -267,21 +264,75 @@ def prioritize_pending_jobs(jobs):
                     marker = scene_dir / "scene.json"
                     if scene_dir.is_symlink() or scene_dir.parent.is_symlink() or marker.is_symlink() or not marker.is_file():
                         return False
-                return True
+                return job.scene_count
             if len(text) <= 4096:
                 hint = json.loads(text)
-                return (isinstance(hint, dict) and
+                if (isinstance(hint, dict) and
                         hint.get("policy") == "clear-land-exact-time-unique-pixels-v1" and
                         type(hint.get("processed_scenes")) is int and
-                        hint["processed_scenes"] == job.scene_count)
+                        0 <= hint["processed_scenes"] <= job.scene_count):
+                    return hint["processed_scenes"]
         except (OSError, ValueError, UnicodeError):
             pass
         return False
 
+    return int(read_hint())
+
+
+def prioritize_pending_jobs(jobs):
+    """Stable partition only: all hinted-complete jobs still validate normally."""
     pending, hinted_complete = [], []
     for job in jobs:
-        (hinted_complete if looks_complete(job) else pending).append(job)
+        (hinted_complete if processed_scene_hint(job) == job.scene_count else pending).append(job)
     return pending + hinted_complete
+
+
+def smallest_region_jobs(inventory, jobs, *, read_hints=False, pending_first=False):
+    """Estimate relative remaining work; never infer bytes or omit a month.
+
+    Area × remaining candidates is a coarse upper-work proxy, not measured
+    transfer size: cloud/overlap filtering and footprints change actual work.
+    Plan mode uses inventory only; runtime hints may affect order, never validity.
+    """
+    groups, hints = {}, {}
+    for job in jobs:
+        groups.setdefault(job.code, []).append(job)
+        hints[job.name] = processed_scene_hint(job) if read_hints else 0
+    ranking = []
+    for region in inventory.regions:
+        group = groups.get(region.code, [])
+        if not group:
+            continue
+        remaining = sum(job.scene_count - hints[job.name] for job in group)
+        ranking.append({"code": region.code, "remaining_candidate_hint": remaining,
+                        "area_km2": region.area_m2 / 1e6,
+                        "relative_work_hint": remaining * (region.area_m2 / 1e6),
+                        "months_to_validate": len(group)})
+    ranking.sort(key=lambda row: (row["relative_work_hint"], row["area_km2"], row["code"]))
+    ordered = []
+    for row in ranking:
+        group = groups[row["code"]]
+        if pending_first:
+            group = sorted(group, key=lambda job: hints[job.name] == job.scene_count)
+        ordered.extend(group)
+    return ordered, ranking
+
+
+def run_region_jobs(jobs, nodes, runner, emit=print, check_cancelled=lambda: None, **policy):
+    """A region barrier: join all month workers before dispatching another region."""
+    groups, results = {}, {}
+    for job in jobs:
+        groups.setdefault(job.code, []).append(job)
+    for code, group in groups.items():
+        check_cancelled()
+        emit(f"区域开始 {code}：集中运行并核验 {len(group)} 个月份。")
+        completed = run_jobs(group, nodes, runner, emit, check_cancelled, **policy)
+        results.update(completed)
+        if len(completed) != len(group) or any(completed.values()):
+            emit(f"区域未完成 {code}：后续研究区暂不启动。")
+            break
+        emit(f"区域完成 {code}：全部 {len(group)} 个月份已通过下载器核验，可开展该区后续处理。")
+    return results
 
 
 class ArchiveRunner(cluster.SSHRunner):
@@ -388,11 +439,15 @@ def main(argv=None):
         inventory = read_inventory(args.inventory)
         validated = region_arguments(args, inventory)
         jobs = fair_jobs(inventory, next(iter(validated.values())).out)
+        region_priority = []
+        if args.schedule == "smallest-first":
+            jobs, region_priority = smallest_region_jobs(inventory, jobs)
         summary = {"start": inventory.start.isoformat(), "end_exclusive": inventory.end.isoformat(),
                    "out": next(iter(validated.values())).out, "nodes": args.nodes,
                    "tile_workers_per_node": args.workers,
                    "max_tiles_in_flight": args.workers * len(args.nodes),
                    "max_scenes_per_job": next(iter(validated.values())).max_scenes,
+                   "schedule": args.schedule, "region_priority_inventory_only": region_priority,
                    "network_retry_policy": {"exit_code": NETWORK_TEMPORARY_EXIT,
                                             "mapped_download_ssh_exit_code": 255,
                                             "retries": args.network_job_retries,
@@ -426,10 +481,17 @@ def main(argv=None):
             with cluster.output_lock(summary["out"]):
                 try:
                     preflight(jobs, args.nodes, runner, lambda value: print(value, flush=True))
-                    if args.resume_pending_first:
+                    if args.schedule == "smallest-first":
+                        jobs, ranking = smallest_region_jobs(inventory, jobs, read_hints=True,
+                                                             pending_first=args.resume_pending_first)
+                        print("区域优先顺序（剩余候选×面积估计，非实测字节）：" +
+                              " → ".join(row["code"] for row in ranking), flush=True)
+                        print("区域排序详情：" + json.dumps(ranking, ensure_ascii=False), flush=True)
+                    elif args.resume_pending_first:
                         jobs = prioritize_pending_jobs(jobs)
                         print("断点优先：先运行未完成月份；全部月份仍在队列中，完成提示不替代原有核验。", flush=True)
-                    results = run_jobs(jobs, args.nodes, runner,
+                    scheduler = run_region_jobs if args.schedule == "smallest-first" else run_jobs
+                    results = scheduler(jobs, args.nodes, runner,
                                        lambda value: print(value, flush=True), runner.check_cancelled,
                                        network_job_retries=args.network_job_retries,
                                        network_retry_delay=args.network_retry_delay)

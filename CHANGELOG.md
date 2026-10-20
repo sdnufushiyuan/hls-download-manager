@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add smallest remaining region scheduling with a completion barrier across all nodes.
+- Preserve all cached months and validate them before handing a region to downstream work.
+- Show region readiness in the progress panel; default new service deployments to this policy.
+
 ## 0.1.0 — 2026-10-19
 
 - Extract the HLS v2 OPTRAM downloader and bounded tile parallelism.

@@ -106,6 +106,15 @@ class RateTests(unittest.TestCase):
         text=render(s,width=140)
         self.assertIn("景/小时",text);self.assertIn("预计剩余：约",text);self.assertIn("预计完成",text)
 
+    def test_region_status_renderer_handles_idle_nodes_and_ready_region(self):
+        s=snapshot();s['nodes']={'master':{'job':None}}
+        s['regions']=[{'code':'RIS','completed_scenes':10,'total_scenes':10,
+                       'completed_jobs':1,'total_jobs':1,'ready_for_processing':True}]
+        self.assertIn('已完成，可后续处理',render(s,width=140))
+        s['regions'][0]['ready_for_processing']=False
+        s['nodes']['master']['job']='RIS/2020-01-01__2020-02-01'
+        self.assertIn('下载/核验中',render(s,width=140))
+
     def test_existing_json_command_includes_new_fields_without_continuous_loop(self):
         import watch_hls_progress as watch
         output=io.StringIO()

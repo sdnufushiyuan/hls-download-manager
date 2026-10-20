@@ -531,6 +531,10 @@ class ProgressCollector:
             completed_scenes += scenes_done
             region_rows.append({"code": code, "completed_scenes": scenes_done,
                                 "total_scenes": sum(month.expected for month in months),
+                                "ready_for_processing": bool(nas["mounted"] and months and
+                                    jobs_done == len(months) and all(
+                                        len(month.scenes) == month.expected and
+                                        self._job_status.get(month.name) == "success" for month in months)),
                                 "completed_jobs": jobs_done, "total_jobs": len(months)})
         nodes = {}
         for node in NODES:

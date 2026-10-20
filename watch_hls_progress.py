@@ -145,11 +145,16 @@ def render(snapshot, width=110, interval=5):
         elif target and count == target:
             lines.append("  本月候选已处理，等待任务结束确认。")
         lines.append("")
-    lines.append("研究区         已处理候选 / 库存参考     成功月 / 总月")
+    lines.append("研究区         已处理候选 / 库存参考     成功月 / 总月    状态")
     for region in snapshot.get("regions", []):
+        active_region = any((record.get("job") or "").startswith(region['code'] + '/')
+                            for record in snapshot.get('nodes', {}).values())
+        region_status = ("已完成，可后续处理" if region.get('ready_for_processing') else
+                         "下载/核验中" if active_region else "待完成")
         lines.append(f"  {region['code']:<5} {region.get('completed_scenes', 0):>8,} / "
                      f"{region.get('total_scenes', 0):<8,}      "
-                     f"{region.get('completed_jobs', 0):>3} / {region.get('total_jobs', 0)}")
+                     f"{region.get('completed_jobs', 0):>3} / {region.get('total_jobs', 0)}    "
+                     f"{region_status}")
     lines.append("")
     nas = snapshot.get("nas", {})
     if nas.get("mounted") and nas.get("free_gib") is not None:

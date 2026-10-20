@@ -113,6 +113,24 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(value["completed_scenes"], 2)
         self.assertEqual(value["completed_jobs"], 1)
 
+    def test_region_ready_requires_successful_month_exit_and_available_nas(self):
+        month, scenes = self.manifest()
+        for scene in scenes:
+            self.completed(month, scene)
+        def ready():
+            return next(row for row in self.collector.snapshot()['regions'] if row['code']=='MES')['ready_for_processing']
+        self.assertFalse(ready())  # File hints alone cannot announce readiness.
+        self.end()
+        self.assertTrue(ready())
+        self.start()
+        self.assertFalse(ready())
+        self.end(status=1)
+        self.assertFalse(ready())
+        self.end()
+        self.assertTrue(ready())
+        self.mounted=False
+        self.assertFalse(ready())
+
     def test_selection_skip_counts_are_separate_from_processed_candidates(self):
         month, scenes = self.manifest()
         for scene in scenes:

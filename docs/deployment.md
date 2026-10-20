@@ -77,8 +77,13 @@ systemctl --user start hls-download-proxy.service
 
 ```bash
 .venv/bin/python run_hls_archive.py \
-  --inventory runs/archive/inventory.json --out /nasdata/HLS/archive --plan
+  --inventory runs/archive/inventory.json --out /nasdata/HLS/archive \
+  --schedule smallest-first --plan
 ```
+
+部署JSON的`schedule`默认为`smallest-first`，优先完整交付估计剩余体量较小的研究区；设为`fair`可恢复轮转。计划仅用冻结库存排序，不读取NAS完成提示；实际运行会持锁后结合已有进度重新排序。切换调度时先正常停止归档服务，再更新参数并启动，继续使用相同inventory和输出目录，保留全部下载进度。无需停止代理或自动选路服务。
+
+每个区日志出现“区域完成”、面板显示“已完成，可后续处理”后，可读取该区目录开展后续工作；将分析结果放到独立目录，保留原始下载文件和核验记录。其他研究区仍会继续下载。
 
 单ROI的其他研究可直接使用`download_hls_optram.py`或`run_hls_cluster.py`，无需凑齐六个ROI；v0.1的六区面板/库存暂不用于该模式。
 
