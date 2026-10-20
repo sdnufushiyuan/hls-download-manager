@@ -29,13 +29,14 @@ def step(streak,ever,water,land,valid):
     ever|=streak>=2
 
 
-def build(manifest,output):
+def build(manifest,output,check=lambda:None):
     if manifest.get('raw_unfiltered_fmask') is not True:
         raise ValueError('Original unfiltered Fmask required; NoData is not water evidence')
     records=manifest['observations']
     if not isinstance(records,list) or not records:raise ValueError('No QA observations')
     groups=defaultdict(list);grid=None;fingerprints=[];seen=set()
     for row in records:
+        check()
         date=row['date'];datetime.strptime(date,'%Y%m%d')
         if len(date)!=8 or row['product'] not in ('L30','S30'):raise ValueError('Invalid date/product')
         identity=(date,row['product'])
@@ -64,9 +65,11 @@ def build(manifest,output):
                             meaning='1=exclude this position on every date; 0=no qualifying sequence')
             for r in range(0,grid[1],256):
                 for c in range(0,grid[0],256):
+                    check()
                     win=Window(c,r,min(256,grid[0]-c),min(256,grid[1]-r))
                     shape=(int(win.height),int(win.width));streak=np.zeros(shape,dtype='uint8');ever=np.zeros(shape,dtype=bool)
-                    for date,paths in sorted(groups.items()):
+                    for number,(date,paths) in enumerate(sorted(groups.items())):
+                        if number%64==0:check()
                         water=np.zeros(shape,dtype=bool);land=water.copy()
                         for path in paths:
                             with rasterio.open(path) as ds:qa=ds.read(1,window=win,masked=True)
@@ -81,7 +84,9 @@ def build(manifest,output):
             for win,digest in expected:
                 if hashlib.sha256(ds.read(1,window=win).tobytes()).hexdigest()!=digest:raise ValueError('Mask readback mismatch')
         for row in records:
+            check()
             if file_hash(Path(row['path']))!=row['sha256']:raise ValueError('QA source changed during mask build')
+        check()
         os.replace(temp,output)
         receipt={'policy':POLICY,'consecutive_valid_dates':2,'apply_to':'all dates, all L30/S30/FUSED products',
             'same_day':'one UTC-date vote; clear-sensor disagreement skipped',

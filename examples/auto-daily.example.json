@@ -1,0 +1,11 @@
+{
+  "inventory": "/opt/hls-download-manager/runs/archive/inventory.json",
+  "source_root": "/nasdata/HLS/archive",
+  "output_root": "/nasdata/HLS/daily",
+  "state_root": "/opt/hls-download-manager/runs/auto-daily",
+  "qa_root": "/nasdata/HLS/original-qa",
+  "water_root": "/nasdata/HLS/water-history",
+  "nas_source": "//NAS_HOST/data",
+  "proxy": "http://127.0.0.1:8118",
+  "interval": 300
+}

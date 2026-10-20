@@ -90,6 +90,31 @@ TimeoutStopSec=15
 [Install]
 WantedBy=default.target hls-download-proxy.service
 '''}
+    auto_config=config.get('auto_daily_config')
+    if auto_config:
+        if not Path(auto_config).is_absolute():raise ValueError('auto_daily_config must be absolute')
+        units['hls-auto-daily.service']=f'''[Unit]
+Description=HLS completed-region QA history and daily mosaics
+ConditionHost=master
+After=hls-download-proxy.service
+Wants=hls-download-proxy.service
+
+[Service]
+Type=simple
+{common}ExecStart={' '.join(map(word,[python,'-u',root/'hls_auto_daily.py','--config',auto_config,'--run']))}
+Restart=on-failure
+RestartSec=300
+Nice=15
+UMask=0077
+CPUQuota=50%
+MemoryHigh=512M
+MemoryMax=1G
+IOWeight=50
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
+'''
     daily=config.get('daily_mosaic')
     if daily:
         daily_out=Path(daily['output_root']);daily_state=Path(daily['state_root'])

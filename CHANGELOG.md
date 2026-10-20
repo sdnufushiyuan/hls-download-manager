@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add a resumable per-region supervisor: verify a complete region, acquire original daily Fmask in serial fixed-grid chunks, build its complete-history water mask, and deliver L30/S30/FUSED without waiting for other regions.
+- Isolate regional failures, preserve frozen source inventory, bind completed-region receipts to sources/history, and provide an optional systemd user service.
+
 - Add a full-network completion gate and a verified, fixed-grid historical water mask required before daily processing.
 - Add two-consecutive-valid-UTC-date water exclusion, skipping clouds/missing dates, resetting on land and deduplicating same-day sensors; apply the static mask to every product/date and fused provenance.
 

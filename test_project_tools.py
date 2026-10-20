@@ -43,6 +43,12 @@ class ProjectToolsTests(unittest.TestCase):
         self.assertIn('"--grouping" "region-day"',daily)
         self.assertIn('"--fuse-products"',daily)
         self.assertIn('"--require-network-complete"',daily)
+        auto=render(dict(config,auto_daily_config='/opt/private/auto.json'),root)['hls-auto-daily.service']
+        self.assertIn('hls_auto_daily.py',auto)
+        self.assertIn('Restart=on-failure',auto)
+        self.assertIn('"--config" "/opt/private/auto.json" "--run"',auto)
+        self.assertNotIn('ExecStartPost',auto)
+        with self.assertRaises(ValueError):render(dict(config,auto_daily_config='relative.json'),root)
         changed=render(dict(config,daily_mosaic=dict(config['daily_mosaic'],layout='product-region')),root)
         self.assertIn('"--layout" "product-region"',changed['hls-daily-mosaic.service'])
         with self.assertRaises(ValueError):render(dict(config,daily_mosaic=dict(config['daily_mosaic'],layout='unknown')),root)

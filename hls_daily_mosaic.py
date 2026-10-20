@@ -533,6 +533,28 @@ def parser():
     return result
 
 
+def committed_blocks_exist(directory,scenes,records,check=lambda:None):
+    """One NAS directory listing per scene, avoiding repeated ancestor stats.
+
+    load_month has already checked scene directories/filenames and parent links.
+    Required TIFFs and sidecars must still be regular files, never symlinks.
+    SHA and raster contents remain checked when composing the actual output.
+    """
+    for scene in scenes:
+        check()
+        expected={name for entry in records[scene['id']]['tiles']
+                  for name in (entry['file'],str(Path(entry['file']).with_suffix('.json')))}
+        if not expected:continue
+        scene_dir=Path(directory)/scene['sensor']/scene['index']
+        try:
+            with os.scandir(scene_dir) as entries:
+                present={entry.name for entry in entries
+                         if entry.name in expected and entry.is_file(follow_symlinks=False)}
+        except FileNotFoundError:return False
+        if present!=expected:return False
+    return True
+
+
 def network_complete(inventory,source,geometry_cache,check=lambda:None):
     """Hints can delay work, never authorize it; verify committed scene metadata last."""
     jobs=archive.fair_jobs(inventory,str(source))
@@ -548,11 +570,7 @@ def network_complete(inventory,source,geometry_cache,check=lambda:None):
             check();directory=Path(source)/region.code/f'{month.start}__{month.end}'
             try:
                 _,scenes,records,_,_=load_month(directory,roi,payload,month.scene_count)
-                for scene in scenes:
-                    for entry in records[scene['id']]['tiles']:
-                        path=directory/scene['sensor']/scene['index']/entry['file']
-                        no_symlink(path)
-                        if not path.is_file() or not path.with_suffix('.json').is_file():return False,str(directory)
+                if not committed_blocks_exist(directory,scenes,records,check):return False,str(directory)
             except (MosaicError,FileNotFoundError,KeyError,ValueError):return False,str(directory)
     return True,None
 
