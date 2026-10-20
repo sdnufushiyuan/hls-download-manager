@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 import numpy as np
@@ -142,7 +143,71 @@ def cached(path, contract):
     return True
 
 
-def download_chunk(image, tile, path, crs, session, contract, check):
+class QAHTTPError(requests.exceptions.HTTPError):
+    """Safe numeric server diagnostics; never retain a signed URL/response."""
+    def __init__(self,status,category,retry_after=0):
+        super().__init__(f'QA HTTP {status}: {category}')
+        self.http_status=status;self.category=category;self.retry_after=retry_after
+
+
+def check_response(response):
+    if response.status_code<400:return
+    raw=next(iter(response.iter_content(32768)),b'')
+    try:
+        error=json.loads(raw).get('error',{})
+        remote=error.get('status','') if isinstance(error,dict) else ''
+        message=error.get('message','').lower() if isinstance(error,dict) else ''
+    except (ValueError,AttributeError):remote='';message=''
+    category='http-error'
+    if remote=='RESOURCE_EXHAUSTED' or any(word in message for word in ('quota','eecu','rate limit')):
+        category='quota-or-rate-limit'
+    elif remote in ('INTERNAL','UNAVAILABLE') or response.status_code>=500:category='server-or-proxy-error'
+    elif response.status_code in (401,403):category='authorization-or-signed-url'
+    elif response.status_code==400:category='invalid-request'
+    value=response.headers.get('Retry-After','')
+    delay=min(int(value),3600) if isinstance(value,str) and value.isdigit() else 0
+    raise QAHTTPError(response.status_code,category,delay)
+
+
+def safe_error(error):
+    result={'error_type':type(error).__name__}
+    if isinstance(error,QAHTTPError):result.update(http_status=error.http_status,category=error.category)
+    elif isinstance(error,requests.exceptions.HTTPError) and error.response is not None:
+        result['http_status']=error.response.status_code
+    return result
+
+
+def retry_wait(seconds,check):
+    end=time.monotonic()+seconds
+    while time.monotonic()<end:
+        check();time.sleep(min(1,max(0,end-time.monotonic())))
+
+
+def qa_session(proxy):
+    session=requests.Session();session.trust_env=False
+    if proxy:session.proxies.update(http=proxy,https=proxy)
+    return session
+
+
+def download_chunk(image,tile,path,crs,session,contract,check,report=None):
+    delays=(5,15,30)
+    for attempt in range(len(delays)+1):
+        try:return _download_chunk_once(image,tile,path,crs,session,contract,check)
+        except InterruptedError:raise
+        except Exception as error:
+            if isinstance(error,QAHTTPError):
+                transient=(error.http_status in (408,425,429,500,502,503,504) or
+                           (error.http_status==400 and error.category=='server-or-proxy-error'))
+            else:transient=h.is_transient_error(error)
+            if not transient or attempt==len(delays):raise
+            delay=max(delays[attempt],getattr(error,'retry_after',0))
+            detail={**safe_error(error),'tile':tile.name,'retry':attempt+1,'retry_limit':len(delays),'wait_seconds':delay}
+            if report:report(**detail)
+            else:print(json.dumps({'phase':'qa-transfer-retry',**detail}),flush=True)
+            retry_wait(delay,check)
+
+
+def _download_chunk_once(image, tile, path, crs, session, contract, check):
     if cached(path, contract):
         inspect_qa(path, tile.width, tile.height, Affine(*tile.transform), crs)
         return
@@ -156,7 +221,7 @@ def download_chunk(image, tile, path, crs, session, contract, check):
         # Preserve the serializable export provenance separately.
         url = h.get_download_url(image, dict(parameters))
         with session.get(url, stream=True, timeout=(30, 180)) as response:
-            response.raise_for_status()
+            check_response(response)
             size = 0
             with temporary.open('xb') as stream:
                 for chunk in response.iter_content(256 * 1024):
@@ -247,10 +312,7 @@ def prepare_history(region, config, paths, check, progress):
     observations = []
     ee = None
     proxy = config.get('proxy', 'http://127.0.0.1:8118')
-    with requests.Session() as session:
-        session.trust_env = False
-        if proxy:
-            session.proxies.update(http=proxy, https=proxy)
+    with qa_session(proxy) as session:
         for number, ((date, product), members) in enumerate(sorted(grouped.items()), 1):
             check()
             day_contract = {**contract, 'assets': sorted(s['id'] for s in members), 'date': date, 'product': product}
@@ -267,7 +329,9 @@ def prepare_history(region, config, paths, check, progress):
                 for tile in tiles:
                     chunk = root / 'chunks' / product / date / tile.name
                     download_chunk(image, tile, chunk, crs, session,
-                                   {**day_contract, 'tile': tile.name, 'ee_version': ee.__version__}, check)
+                                   {**day_contract, 'tile': tile.name, 'ee_version': ee.__version__}, check,
+                                   report=lambda **detail:progress('qa-transfer-retry',region=region.code,
+                                       date=date,product=product,**detail))
                     chunks.append((tile, chunk))
                 assemble_day(path, chunks, roi, crs, grid, day_contract, check)
             observations.append({'date': date, 'product': product, 'path': str(path), 'sha256': h.file_hash(path)})
@@ -352,7 +416,7 @@ def run_cycle(config, paths, check, progress):
             raise
         except Exception as error:
             # URLs, authentication headers and provider exceptions are not logged.
-            results[region.code] = {'phase': 'blocked', 'error_type': type(error).__name__}
+            results[region.code] = {'phase': 'blocked', **safe_error(error)}
             if isinstance(error, (ValueError, m.MosaicError)):
                 results[region.code]['reason'] = str(error)
         progress('region-scan', regions=results)

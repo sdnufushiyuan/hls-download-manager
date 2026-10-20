@@ -23,6 +23,8 @@ cp examples/auto-daily.example.json private/auto-daily.local.json
 
 状态保存在`state_root/status.json`，完整区域收据在`state_root/REGION/completed.json`。当所有区域交付完毕程序正常退出。通过systemd运行时使用`Restart=on-failure`，不会在全部成功后反复重启。
 
+QA的EE接口使用显式httplib2代理，GeoTIFF传输使用显式HTTP/HTTPS代理并禁用环境代理推断，避免NO_PROXY或系统环境使请求绕行。408/425/429/500/502/503/504和连接超时等暂时性错误，会在当前块内最多重试三次（5/15/30秒，若服务器给出数值Retry-After则相应延长，最多一小时）。每次重新申请下载URL；终止请求不覆盖已核验文件。终止错误和重试状态记录HTTP数字状态码、有限分类，避免只显示HTTPError；不记录签名URL、令牌或完整服务端响应。无效请求及权限拒绝不会无限重试。
+
 ## 明确排除不需要的月份
 
 用户决定舍弃某个整月/末月分片时，在私有自动配置加入例如：

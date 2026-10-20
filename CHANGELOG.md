@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Keep transient original-QA transfer failures within the current chunk with bounded backoff, refreshed download URLs and safe numeric HTTP diagnostics; explicitly test proxy routing despite environment bypass settings.
+
 - Support explicit, reasoned per-region month exclusions consistently across download-readiness checks, original-QA history and daily output; preserve the original frozen inventory and source data.
 
 - Add a resumable per-region supervisor: verify a complete region, acquire original daily Fmask in serial fixed-grid chunks, build its complete-history water mask, and deliver L30/S30/FUSED without waiting for other regions.

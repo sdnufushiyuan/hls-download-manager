@@ -1,6 +1,8 @@
 from datetime import date
 from pathlib import Path
 import tempfile
+import json
+import os
 import unittest
 from unittest.mock import Mock, patch
 import numpy as np
@@ -13,6 +15,43 @@ import run_hls_archive as archive
 
 
 class AutoDailyTests(unittest.TestCase):
+    def test_proxy_is_explicit_for_both_schemes_even_with_no_proxy_environment(self):
+        with patch.dict(os.environ,{'NO_PROXY':'*','HTTPS_PROXY':'http://example.org:9'}):
+            with auto.qa_session('http://127.0.0.1:8118') as session:
+                self.assertFalse(session.trust_env)
+                for url in ['https://earthengine.googleapis.com/x','http://example.org/x']:
+                    merged=session.merge_environment_settings(url,{},False,True,None)
+                    self.assertEqual(merged['proxies'][url.split(':')[0]],'http://127.0.0.1:8118')
+
+    def test_transient_download_retries_current_chunk_without_abandoning_region(self):
+        tile=h.Tile(0,0,0,30,1,1);report=Mock()
+        error=auto.QAHTTPError(502,'server-or-proxy-error')
+        with patch.object(auto,'_download_chunk_once',side_effect=[error,None]) as transfer, \
+                patch.object(auto,'retry_wait') as wait:
+            auto.download_chunk(None,tile,Path('/example/qa.tif'),'EPSG:32614',None,{},lambda:None,report)
+        self.assertEqual(transfer.call_count,2)
+        self.assertEqual(transfer.call_args_list[0].args[2],transfer.call_args_list[1].args[2])
+        self.assertEqual(report.call_args.kwargs['http_status'],502)
+        wait.assert_called_once()
+
+    def test_terminal_http_request_error_is_not_blindly_retried(self):
+        tile=h.Tile(0,0,0,30,1,1)
+        with patch.object(auto,'_download_chunk_once',side_effect=auto.QAHTTPError(400,'invalid-request')) as transfer, \
+                patch.object(auto,'retry_wait') as wait:
+            with self.assertRaises(auto.QAHTTPError):
+                auto.download_chunk(None,tile,Path('/example/qa.tif'),'EPSG:32614',None,{},lambda:None)
+        self.assertEqual(transfer.call_count,1);wait.assert_not_called()
+
+    def test_error_diagnostics_keep_status_and_quota_but_never_signed_url(self):
+        response=Mock(status_code=429,headers={'Retry-After':'120'})
+        response.iter_content.return_value=[json.dumps({'error':{'status':'RESOURCE_EXHAUSTED',
+            'message':'quota error https://example.org/?token=private-value'}}).encode()]
+        with self.assertRaises(auto.QAHTTPError) as raised:auto.check_response(response)
+        detail=auto.safe_error(raised.exception)
+        self.assertEqual(detail['http_status'],429)
+        self.assertEqual(detail['category'],'quota-or-rate-limit')
+        self.assertNotIn('private-value',json.dumps(detail));self.assertEqual(raised.exception.retry_after,120)
+
     def test_explicit_last_month_exclusion_preserves_original_and_other_regions(self):
         sept=archive.Month(date(2026,9,1),date(2026,10,1),5)
         october=archive.Month(date(2026,10,1),date(2026,10,10),10)
@@ -67,7 +106,7 @@ class AutoDailyTests(unittest.TestCase):
             with rasterio.open(source,'w',driver='GTiff',width=1,height=1,count=1,dtype='uint8',
                     crs='EPSG:32614',transform=Affine(*tile.transform)) as ds:
                 ds.write(np.array([[96]],dtype='uint8'),1)
-            response=Mock();response.iter_content.return_value=[source.read_bytes()]
+            response=Mock(status_code=200);response.iter_content.return_value=[source.read_bytes()]
             context=Mock();context.__enter__=Mock(return_value=response);context.__exit__=Mock(return_value=False)
             session=Mock();session.get.return_value=context
             def mutate(image,params):
