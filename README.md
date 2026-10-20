@@ -7,6 +7,8 @@
 
 部署配置默认按估计剩余体量从小到大集中下载研究区，三个节点共同推进同一区的不同月份；该区全部月份通过核验后，再开始下一区。面板显示“已完成，可后续处理”后即可单独处理该区，无需等待六区全部结束。已有文件继续校验复用。
 
+需要整图做NDVI–STR等特征空间分析时，可开启[按日整图处理](docs/daily-mosaics.md)：HLS L30按同日期同WRS path/row、HLS S30按同日期同MGRS瓦片输出单个六波段TIFF。独立后台任务处理已完成月份，保留下载块和进度；整图交付状态单独记录。
+
 English: resumable HLS v2 OPTRAM archives, Linux cluster scheduling, verified tile downloads, live progress estimates, and adaptive proxy routing. Deployment instructions are currently in Chinese.
 
 ## 功能

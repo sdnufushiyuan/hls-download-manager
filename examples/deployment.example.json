@@ -6,6 +6,11 @@
   "nodes": ["node1", "node2", "master"],
   "workers": 4,
   "schedule": "smallest-first",
+  "daily_mosaic": {
+    "output_root": "/nasdata/HLS/daily-by-track",
+    "state_root": "/opt/hls-download-manager/runs/daily-mosaic",
+    "interval": 300
+  },
   "mihomo_binary": "/opt/mihomo/mihomo",
   "proxy_config": "/opt/hls-download-manager/private/mihomo.json",
   "optimizer_config": "/opt/hls-download-manager/private/optimizer.json"

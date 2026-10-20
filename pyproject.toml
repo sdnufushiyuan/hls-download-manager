@@ -27,12 +27,14 @@ hls-download = "download_hls_optram:main"
 hls-archive = "run_hls_archive:main"
 hls-progress = "watch_hls_progress:main"
 hls-node-optimize = "hls_node_optimizer:main"
+hls-daily-mosaic = "hls_daily_mosaic:main"
 
 [tool.setuptools]
 py-modules = [
   "download_hls_optram", "hls_download_selection", "run_hls_cluster", "run_hls_node",
   "run_hls_archive", "hls_progress_state", "hls_progress_rates", "watch_hls_progress",
   "hls_node_optimizer", "hls_email_alert",
+  "hls_daily_mosaic",
 ]
 
 [tool.setuptools.dynamic]

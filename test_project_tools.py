@@ -36,6 +36,11 @@ class ProjectToolsTests(unittest.TestCase):
         self.assertIn('--schedule" "smallest-first"',units['hls-archive.service'])
         self.assertIn('--schedule" "fair"',render(dict(config,schedule='fair'),root)['hls-archive.service'])
         with self.assertRaises(ValueError):render(dict(config,schedule='unknown'),root)
+        daily=units['hls-daily-mosaic.service']
+        self.assertIn('hls_daily_mosaic.py',daily)
+        self.assertIn('MemoryMax=512M',daily)
+        self.assertIn('CPUQuota=50%',daily)
+        with self.assertRaises(ValueError):render(dict(config,daily_mosaic={'output_root':config['output_root'],'state_root':'/opt/state'}),root)
         with self.assertRaises(ValueError):render(dict(config,output_root='/tmp/unverified'),root)
 
     def test_unit_values_reject_control_characters_and_escape_percent(self):

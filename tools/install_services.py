@@ -36,7 +36,7 @@ def render(config, root):
     if config.get('schedule','smallest-first') not in ('fair','smallest-first'):raise ValueError('Unknown schedule')
     if not set(config.get('nodes',['node1','node2','master'])).issubset({'node1','node2','master'}):raise ValueError('Unknown node role')
     if type(config.get('workers',4)) is not int or not 1<=config.get('workers',4)<=8:raise ValueError('Workers must be 1–8')
-    return {
+    units = {
       'hls-download-proxy.service':f'''[Unit]
 Description=HLS loopback Mihomo proxy
 ConditionHost=master
@@ -90,6 +90,46 @@ TimeoutStopSec=15
 [Install]
 WantedBy=default.target hls-download-proxy.service
 '''}
+    daily=config.get('daily_mosaic')
+    if daily:
+        daily_out=Path(daily['output_root']);daily_state=Path(daily['state_root'])
+        source=Path(config['output_root'])
+        if (not daily_out.is_absolute() or not daily_state.is_absolute() or
+                not daily_out.is_relative_to('/nasdata') or daily_out==Path('/nasdata') or
+                daily_out==source or source in daily_out.parents or daily_out in source.parents or
+                daily_state==source or source in daily_state.parents):
+            raise ValueError('Daily mosaics need separate absolute output/state directories')
+        interval=daily.get('interval',300)
+        if type(interval) is not int or not 30<=interval<=86400:raise ValueError('Daily interval must be 30–86400')
+        daily_args=[python,'-u',root/'hls_daily_mosaic.py','--inventory',run/'inventory.json',
+                    '--source-root',source,'--output-root',daily_out,'--state-root',daily_state,
+                    '--nas-source',config['nas_source'],'--interval',str(interval),'--watch','--run']
+        units['hls-daily-mosaic.service']=f'''[Unit]
+Description=Verified HLS daily WRS/MGRS GeoTIFF mosaics
+ConditionHost=master
+After=hls-download-proxy.service
+Wants=hls-download-proxy.service
+
+[Service]
+Type=simple
+WorkingDirectory={directory}
+EnvironmentFile={word(environment)}
+ExecStart={' '.join(map(word,daily_args))}
+Restart=on-failure
+RestartSec=300
+RestartPreventExitStatus=1
+Nice=15
+UMask=0077
+CPUQuota=50%
+MemoryHigh=256M
+MemoryMax=512M
+IOWeight=50
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+'''
+    return units
 
 
 def main():

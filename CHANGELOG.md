@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add windowed, verified daily GeoTIFF generation: L30 by UTC date/WRS path-row and S30 by UTC date/MGRS tile.
+- Add provenance metadata caching, same-observation dedup recovery and an optional low-priority mosaic service.
+
 - Add smallest remaining region scheduling with a completion barrier across all nodes.
 - Preserve all cached months and validate them before handing a region to downstream work.
 - Show region readiness in the progress panel; default new service deployments to this policy.
