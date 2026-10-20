@@ -419,6 +419,16 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(node["retry"]["wait_seconds"], 1.5)
         self.assertTrue(0 <= node["retry"]["remaining_seconds"] <= 1.5)
 
+    def test_storage_retry_has_the_same_visible_wait_and_resume_lifecycle(self):
+        self.manifest()
+        self.start()
+        self.event(f"存储恢复等待 node1 MES/{BOUNDARY}，重试 1/4，等待 300 秒。")
+        node = self.collector.snapshot()['nodes']['node1']
+        self.assertEqual(node['phase'], 'retrying')
+        self.assertEqual(node['retry']['wait_seconds'], 300)
+        self.event(f"存储恢复重试 node1 MES/{BOUNDARY}，重试 1/4。")
+        self.assertEqual(self.collector.snapshot()['nodes']['node1']['phase'], 'downloading')
+
     def test_master_worker_has_independent_progress_and_retry_lifecycle(self):
         self.manifest("MES")
         self.manifest("SDR")

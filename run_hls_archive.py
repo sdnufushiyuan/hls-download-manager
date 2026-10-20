@@ -20,6 +20,8 @@ import run_hls_cluster as cluster
 REGION_CODES = ("SDR", "REM", "MES", "RIS", "OZN", "TXS")
 MAX_INVENTORY_BYTES = 8 * 1024 * 1024
 NETWORK_TEMPORARY_EXIT = 75
+STORAGE_TEMPORARY_EXIT = 76
+RECOVERABLE_EXITS = frozenset((NETWORK_TEMPORARY_EXIT, STORAGE_TEMPORARY_EXIT))
 
 
 @dataclass(frozen=True)
@@ -188,7 +190,7 @@ def parser():
     result.add_argument("--max-scenes", type=int, help="默认至少1000，并按库存最大月数量增加10%%+10保护余量")
     result.add_argument("--limit", type=int, help="仅试取时使用：每区域每月前 N 景，非全局限额")
     result.add_argument("--network-job-retries", type=int, choices=range(9), default=4,
-                        help="退出码75的月网络任务额外重试次数，0–8；默认合计最多5次")
+                        help="退出码75/76的月网络/NAS任务额外重试次数，0–8；默认合计最多5次")
     result.add_argument("--network-retry-delay", type=_network_retry_delay, default=300,
                         help="同节点同月网络恢复等待秒数，1–3600，默认300")
     modes = result.add_mutually_exclusive_group()
@@ -359,7 +361,7 @@ class ArchiveRunner(cluster.SSHRunner):
 
 def run_jobs(jobs, nodes, runner, emit=print, check_cancelled=lambda: None, *,
              network_job_retries=4, network_retry_delay=300):
-    """Share regional months; retry only temporary network failures on that node."""
+    """Share months; resume temporary transport/NAS failures on the same node."""
     if not nodes or len(set(nodes)) != len(nodes) or any(node not in cluster.NODES for node in nodes):
         raise ValueError("只允许不重复的 node1/node2/master。")
     validate_network_policy(network_job_retries, network_retry_delay)
@@ -390,17 +392,18 @@ def run_jobs(jobs, nodes, runner, emit=print, check_cancelled=lambda: None, *,
                     if attempt and failed.is_set():
                         break
                     status = runner(job)
-                    if status != NETWORK_TEMPORARY_EXIT or attempt == network_job_retries:
+                    if status not in RECOVERABLE_EXITS or attempt == network_job_retries:
                         break
                     retry = attempt + 1
-                    emit(f"网络恢复等待 {node} {job.name}，重试 {retry}/{network_job_retries}，"
+                    recovery = "存储恢复" if status == STORAGE_TEMPORARY_EXIT else "网络恢复"
+                    emit(f"{recovery}等待 {node} {job.name}，重试 {retry}/{network_job_retries}，"
                          f"等待 {network_retry_delay:g} 秒。")
                     if not wait_for_network():
                         break
                     check_cancelled()
                     if failed.is_set():
                         break
-                    emit(f"网络恢复重试 {node} {job.name}，重试 {retry}/{network_job_retries}。")
+                    emit(f"{recovery}重试 {node} {job.name}，重试 {retry}/{network_job_retries}。")
             except cluster.Cancelled:
                 return
             except Exception as error:
@@ -454,6 +457,10 @@ def main(argv=None):
                                             "max_attempts": args.network_job_retries + 1,
                                             "delay_seconds": args.network_retry_delay,
                                             "scope": "same_node_same_month"},
+                   "storage_retry_policy": {"exit_code": STORAGE_TEMPORARY_EXIT,
+                                            "retries": args.network_job_retries,
+                                            "delay_seconds": args.network_retry_delay,
+                                            "scope": "same_node_same_month"},
                    "job_count": len(jobs),
                    "empty_months_skipped": sum(month.scene_count == 0 for region in inventory.regions for month in region.months),
                    "regions": [{"code": region.code, "crs": region.crs,
@@ -502,7 +509,10 @@ def main(argv=None):
                         # Let systemd resume only exhausted temporary network
                         # failures. Permanent auth/NAS/data errors still stop.
                         failure_codes = {status for status in results.values() if status}
-                        return NETWORK_TEMPORARY_EXIT if failure_codes == {NETWORK_TEMPORARY_EXIT} else 1
+                        if failure_codes and failure_codes <= RECOVERABLE_EXITS:
+                            return (STORAGE_TEMPORARY_EXIT if failure_codes == {STORAGE_TEMPORARY_EXIT}
+                                    else NETWORK_TEMPORARY_EXIT)
+                        return 1
                     return 1 if pending else 0
                 finally:
                     runner.cancel()

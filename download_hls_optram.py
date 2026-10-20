@@ -7,6 +7,7 @@ Dates/paths are supplied by the user; the Cloud project can be read from local c
 from __future__ import annotations
 
 import argparse
+import errno
 from concurrent.futures import CancelledError, FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 import hashlib
@@ -39,6 +40,15 @@ class DownloadError(RuntimeError):
 
 class TransientDownloadError(DownloadError):
     """A bounded transport retry was exhausted; a controller may resume later."""
+
+
+class TransientStorageError(DownloadError):
+    """A verified NAS commit failed after bounded retries; resume verified data."""
+
+
+STORAGE_RETRY_DELAYS = (0.25, 1, 3, 10)
+STORAGE_RETRY_ERRNOS = frozenset((errno.EACCES, errno.EPERM, errno.EBUSY,
+                                 errno.EIO, errno.ESTALE, errno.ETIMEDOUT))
 
 
 class DownloadCancelled(DownloadError):
@@ -356,11 +366,29 @@ class MountGuard:
         return os.fdopen(fd, "wb"), Path(f"/proc/self/fd/{descriptor}/{name}")
 
     def finalize(self, path, temporary, descriptor):
-        self.check()
-        if descriptor is None:
-            os.replace(temporary, path)
-        else:
-            os.replace(path.name + ".part", path.name, src_dir_fd=descriptor, dst_dir_fd=descriptor)
+        # CIFS can deny replacement while a reader has the old file open.
+        # Retry the same closed partial, without unlinking the target or
+        # downloading/encoding it again. Keep mount and dir-fd protections.
+        for attempt in range(len(STORAGE_RETRY_DELAYS) + 1):
+            self.check()
+            try:
+                if descriptor is None:
+                    os.replace(temporary, path)
+                else:
+                    os.replace(path.name + ".part", path.name,
+                               src_dir_fd=descriptor, dst_dir_fd=descriptor)
+                return
+            except OSError as error:
+                if self.mount is None or error.errno not in STORAGE_RETRY_ERRNOS:
+                    raise
+                diagnostic = f"op=replace errno={error.errno} file={path.name}"
+                if attempt == len(STORAGE_RETRY_DELAYS):
+                    raise TransientStorageError(
+                        f"NAS 原子提交重试耗尽：{diagnostic}；已完成数据保留，可校验断点后续跑。") from None
+                delay = STORAGE_RETRY_DELAYS[attempt]
+                print(f"  NAS 原子提交暂时失败：{diagnostic}；等待 {delay:g} 秒后重试 "
+                      f"{attempt + 1}/{len(STORAGE_RETRY_DELAYS)}", flush=True)
+                time.sleep(delay)
 
 
 def write_json(path, value, guard):
@@ -1160,8 +1188,15 @@ def main():
     except TransientDownloadError as error:
         print(f"网络暂时失败：{error}", file=sys.stderr)
         return 75
+    except TransientStorageError as error:
+        print(f"存储暂时失败：{error}", file=sys.stderr)
+        return 76
     except (DownloadError, ValueError) as error:
         print(f"错误：{error}", file=sys.stderr)
+        return 1
+    except OSError as error:
+        print(f"本地文件操作失败：{type(error).__name__} errno={error.errno}；"
+              "未标记完成，检查挂载、空间及权限。", file=sys.stderr)
         return 1
     except Exception as error:
         # Avoid echoing signed download URLs or authentication material in raw traces.

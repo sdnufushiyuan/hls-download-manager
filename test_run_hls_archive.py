@@ -410,7 +410,7 @@ class ArchiveTests(unittest.TestCase):
         runner.cancel.assert_called_once()
 
     def test_network_exhaustion_requests_service_retry_but_permanent_error_stops(self):
-        for status, expected in ((75, 75), (1, 1)):
+        for status, expected in ((75, 75), (76, 76), (1, 1)):
             with self.subTest(status=status), \
                     patch.object(sys, "stdin", io.StringIO(json.dumps(fixture()))), \
                     patch.object(cluster, "require_master"), \
@@ -423,6 +423,28 @@ class ArchiveTests(unittest.TestCase):
                     "--inventory", "-", "--out", self.args().out, "--run",
                     "--nodes", "node1", "--network-job-retries", "0",
                 ]), expected)
+
+    def test_storage_retry_keeps_same_month_and_then_continues_queue(self):
+        jobs = archive.fair_jobs(archive.parse_inventory(fixture()), self.args().out)[:2]
+        runner = Mock(side_effect=[76, 0, 0])
+        messages = []
+        with self.retry_clock() as delays:
+            result = archive.run_jobs(jobs, ('master',), runner, messages.append,
+                                      network_retry_delay=1)
+        self.assertEqual(list(result.values()), [0, 0])
+        self.assertIs(runner.call_args_list[0].args[0], runner.call_args_list[1].args[0])
+        self.assertEqual(runner.call_count, 3)
+        self.assertAlmostEqual(sum(delays), 1)
+        self.assertTrue(any(m.startswith('存储恢复等待 master ') for m in messages))
+
+    def test_storage_retry_is_bounded_and_preserves_failure_for_systemd(self):
+        job = archive.fair_jobs(archive.parse_inventory(fixture()), self.args().out)[0]
+        runner = Mock(return_value=76)
+        with self.retry_clock():
+            result = archive.run_jobs([job], ('master',), runner, lambda _: None,
+                                      network_job_retries=2)
+        self.assertEqual(result, {job.name: 76})
+        self.assertEqual(runner.call_count, 3)
 
     def test_invalid_nodes_and_out_root_never_start(self):
         with self.assertRaises(ValueError):

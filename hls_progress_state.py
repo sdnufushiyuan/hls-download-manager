@@ -33,9 +33,9 @@ NODE_PATTERN = r"(node[12]|master)"
 START_RE = re.compile(r"^开始 " + NODE_PATTERN + " " + JOB_PATTERN + r"，库存候选 \d+$")
 END_RE = re.compile(r"^结束 " + NODE_PATTERN + " " + JOB_PATTERN + r"，退出码 (\d+)，已结束 \d+/\d+$")
 FINAL_RE = re.compile(r"^结束：完成 (\d+)；失败 (\d+)；未启动 (\d+)。$")
-RETRY_WAIT_RE = re.compile(r"^网络恢复等待 " + NODE_PATTERN + " " + JOB_PATTERN + r"，重试 (\d+)/(\d+)，等待 (\d+(?:\.\d+)?) 秒。$")
-RETRY_START_RE = re.compile(r"^网络恢复重试 " + NODE_PATTERN + " " + JOB_PATTERN + r"，重试 (\d+)/(\d+)。$")
-JOURNAL_FILTER = r"^(开始 (node[12]|master) |结束 (node[12]|master) |网络恢复等待 (node[12]|master) |网络恢复重试 (node[12]|master) |结束：|错误：|离线预检 |(node[12]|master) (SDR|REM|MES|RIS|OZN|TXS)/|已停止新任务)"
+RETRY_WAIT_RE = re.compile(r"^(?:网络|存储)恢复等待 " + NODE_PATTERN + " " + JOB_PATTERN + r"，重试 (\d+)/(\d+)，等待 (\d+(?:\.\d+)?) 秒。$")
+RETRY_START_RE = re.compile(r"^(?:网络|存储)恢复重试 " + NODE_PATTERN + " " + JOB_PATTERN + r"，重试 (\d+)/(\d+)。$")
+JOURNAL_FILTER = r"^(开始 (node[12]|master) |结束 (node[12]|master) |(网络|存储)恢复等待 (node[12]|master) |(网络|存储)恢复重试 (node[12]|master) |结束：|错误：|离线预检 |(node[12]|master) (SDR|REM|MES|RIS|OZN|TXS)/|已停止新任务)"
 
 
 def _read_json(path, max_bytes):
