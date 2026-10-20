@@ -3,10 +3,29 @@ import json
 import tempfile
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 import hls_system_monitor as monitor
 
 
 class MonitorTests(unittest.TestCase):
+    def test_archive_view_uses_small_summaries_and_never_scene_or_block_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'download_selection_summary.json').write_text(json.dumps({
+                'policy':'clear-land-exact-time-unique-pixels-v1','processed_scenes':2}))
+            from unittest.mock import Mock
+            collector=SimpleNamespace(_configuration_warnings=[],_job_status={},_active_nodes={'master':'RIS/month'},
+                _retries={},_current_failed=set(),months={'RIS/month':SimpleNamespace(path=root,code='RIS',expected=3)},
+                _service=Mock(return_value={'active':'active'}),_proxy=Mock(return_value={}),
+                _journal=Mock(),_nas=Mock(return_value={'mounted':True}),
+                _recover=Mock(side_effect=AssertionError('must not scan scenes')))
+            result=monitor.archive_snapshot(collector)
+            self.assertEqual(result['completed_scenes'],2)
+            self.assertEqual(result['nodes']['master']['job'],'RIS/month')
+            self.assertFalse(result['archive_complete'])
+            self.assertEqual(result['count_mode'],'download-summary-hints')
+            collector._recover.assert_not_called()
+
     def test_credentials_are_redacted_but_other_users_commands_remain_readable(self):
         command='python work.py --password "two words" --token=fake-token https://user:fake-pass@example.org/?access_token=fake-access'
         result=monitor.scrub(command)

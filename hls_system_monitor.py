@@ -166,6 +166,47 @@ def validate(config):
         if host not in ('node1','node2'):raise ValueError('Only existing node1/node2 aliases supported')
 
 
+def archive_snapshot(collector):
+    """Monitoring hints only: never scan scene.json/block files or authorize work."""
+    warnings=list(collector._configuration_warnings)
+    service=collector._service(warnings);proxy=collector._proxy(warnings)
+    collector._journal(service,warnings);nas=collector._nas(warnings)
+    regions={code:{'code':code,'completed_scenes':0,'total_scenes':0,'completed_jobs':0,'total_jobs':0}
+             for code in REGIONS}
+    counts={}
+    for name,month in collector.months.items():
+        done=0;hint_complete=False
+        success=collector._job_status.get(name)=='success'
+        if nas.get('mounted'):
+            try:
+                summary=read_json(month.path/'download_selection_summary.json',65536)
+                value=summary.get('processed_scenes')
+                if (summary.get('policy')=='clear-land-exact-time-unique-pixels-v1' and type(value) is int
+                        and 0<=value<=month.expected):
+                    done=value;hint_complete=done==month.expected
+                elif type(value) is int and value>month.expected:
+                    warnings.append(name+'下载摘要超出冻结库存；该月进度按日志参考，不用于核验')
+            except FileNotFoundError:pass
+            except (OSError,ValueError):warnings.append(name+'摘要暂不可读')
+        if success:done=month.expected
+        counts[name]=done
+        row=regions[month.code];row['total_jobs']+=1;row['total_scenes']+=month.expected
+        row['completed_scenes']+=done;row['completed_jobs']+=bool(success or hint_complete)
+    nodes={}
+    for node,name in collector._active_nodes.items():
+        month=collector.months.get(name);retry=collector._retries.get(node,{})
+        phase='stopped' if service.get('active')!='active' else 'retrying' if retry.get('waiting') else 'downloading' if name else 'waiting'
+        nodes[node]={'job':name,'phase':phase,'completed_scenes':counts.get(name,0),
+                     'total_scenes':month.expected if month else 0}
+    return {'updated_at':datetime.now(timezone.utc).isoformat(),'service':service,'proxy':proxy,'nas':nas,
+        'count_mode':'download-summary-hints','archive_complete':False,'nodes':nodes,'regions':list(regions.values()),
+        'completed_scenes':sum(row['completed_scenes'] for row in regions.values()),
+        'total_scenes':sum(row['total_scenes'] for row in regions.values()),
+        'completed_jobs':sum(row['completed_jobs'] for row in regions.values()),
+        'total_jobs':sum(row['total_jobs'] for row in regions.values()),
+        'warnings':list(dict.fromkeys(warnings)),'failed_jobs':sorted(collector._current_failed)}
+
+
 class Collector:
     def __init__(self,config):
         validate(config);self.config=config;self.lock=threading.Lock();self.stop=threading.Event()
@@ -283,7 +324,7 @@ class Collector:
             collector=state.ProgressCollector(Path(self.config['program_root']))
             rates=ProgressRates();activity=BlockActivity()
             while not self.stop.is_set():
-                snapshot=collector.snapshot();snapshot['throughput']=rates.update(snapshot)
+                snapshot=archive_snapshot(collector);snapshot['throughput']=rates.update(snapshot)
                 snapshot['download_activity']=activity.snapshot(snapshot)
                 self.put(archive=snapshot)
                 self.stop.wait(30)
@@ -320,7 +361,7 @@ def overview(data):
     archive=data.get('archive',{})
     lines.extend(['','原始下载（候选景包含已复用/跳过；不等于正式日图数量）'])
     if 'completed_scenes' in archive:
-        lines.append(f"  月任务 {archive.get('completed_jobs',0)}/{archive.get('total_jobs',0)}；候选 {archive['completed_scenes']:,}/{archive.get('total_scenes',0):,}")
+        lines.append(f"  摘要进度：月任务 {archive.get('completed_jobs',0)}/{archive.get('total_jobs',0)}；候选 {archive['completed_scenes']:,}/{archive.get('total_scenes',0):,}（监控参考，非完整核验）")
         blocks=archive.get('download_activity',{}).get('blocks_per_minute')
         lines.append('  新落盘速度：'+(f'{blocks:.1f} 块/分钟' if blocks is not None else '测速采样中'))
         rate=archive.get('throughput',{})
