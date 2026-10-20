@@ -26,6 +26,25 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(result['count_mode'],'download-summary-hints')
             collector._recover.assert_not_called()
 
+    def test_complete_month_hint_shows_reuse_not_fresh_download_and_keeps_safety_states(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            (root/'download_selection_summary.json').write_text(json.dumps({
+                'policy':'clear-land-exact-time-unique-pixels-v1','processed_scenes':3}))
+            collector=SimpleNamespace(_configuration_warnings=[],_job_status={},_active_nodes={'master':'RIS/month'},
+                _retries={},_current_failed=set(),months={'RIS/month':SimpleNamespace(path=root,code='RIS',expected=3)},
+                _service=Mock(return_value={'active':'active'}),_proxy=Mock(return_value={}),
+                _journal=Mock(),_nas=Mock(return_value={'mounted':True}))
+            result=monitor.archive_snapshot(collector)
+            self.assertEqual(result['nodes']['master']['phase'],'verifying')
+            self.assertFalse(result['archive_complete'])
+            self.assertIn('断点复核/复用','\n'.join(monitor.overview({'archive':result})))
+            collector._retries={'master':{'waiting':True}}
+            self.assertEqual(monitor.archive_snapshot(collector)['nodes']['master']['phase'],'retrying')
+            collector._service.return_value={'active':'failed'}
+            self.assertEqual(monitor.archive_snapshot(collector)['nodes']['master']['phase'],'stopped')
+
     def test_credentials_are_redacted_but_other_users_commands_remain_readable(self):
         command='python work.py --password "two words" --token=fake-token https://user:fake-pass@example.org/?access_token=fake-access'
         result=monitor.scrub(command)

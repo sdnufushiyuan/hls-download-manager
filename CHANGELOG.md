@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Label active months with complete download hints as checkpoint verification/reuse; avoid presenting every active monthly process as fresh downloading.
+
 - Retry verified NAS atomic replacements with bounded backoff when CIFS readers temporarily deny rename; preserve mount checks and distinguish storage exit 76 from terminal errors. Resume the same monthly task and let systemd retry exhausted temporary failures.
 
 - Add a read-only Chinese terminal monitor for master/node1/node2, visible processes and commands across users, services, resource usage and separate archive/QA/daily progress, with search, paging and credential redaction.

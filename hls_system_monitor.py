@@ -196,6 +196,8 @@ def archive_snapshot(collector):
     for node,name in collector._active_nodes.items():
         month=collector.months.get(name);retry=collector._retries.get(node,{})
         phase='stopped' if service.get('active')!='active' else 'retrying' if retry.get('waiting') else 'downloading' if name else 'waiting'
+        if phase=='downloading' and month and month.expected>0 and counts.get(name)==month.expected:
+            phase='verifying'
         nodes[node]={'job':name,'phase':phase,'completed_scenes':counts.get(name,0),
                      'total_scenes':month.expected if month else 0}
     return {'updated_at':datetime.now(timezone.utc).isoformat(),'service':service,'proxy':proxy,'nas':nas,
@@ -367,7 +369,7 @@ def overview(data):
         rate=archive.get('throughput',{})
         lines.append('  全部下载预计剩余：'+(elapsed(rate.get('remaining_seconds')) if rate.get('status')=='ready' else rate.get('reason','测速采样中')))
         for node,row in archive.get('nodes',{}).items():
-            phase={'downloading':'下载中','verifying':'核验中','retrying':'等待重试','waiting':'等待分配','stopped':'已停止','preflight':'启动核验'}.get(row.get('phase'),'读取中')
+            phase={'downloading':'处理/下载','verifying':'断点复核/复用','retrying':'等待重试','waiting':'等待分配','stopped':'已停止','preflight':'启动核验'}.get(row.get('phase'),'读取中')
             lines.append(f"  {node:<7} {phase}  {row.get('job') or '暂无月份'}  {row.get('completed_scenes',0)}/{row.get('total_scenes',0)}景")
     else:lines.append('  下载统计在后台载入，耗时不会卡住面板。')
     qa=data.get('qa',{});phase=qa.get('phase')
