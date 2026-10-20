@@ -32,6 +32,7 @@ hls-progress = "watch_hls_progress:main"
 hls-node-optimize = "hls_node_optimizer:main"
 hls-daily-mosaic = "hls_daily_mosaic:main"
 hls-feature-space = "hls_feature_space:main"
+hls-water-history = "hls_water_history:main"
 
 [tool.setuptools]
 py-modules = [
@@ -40,6 +41,7 @@ py-modules = [
   "hls_node_optimizer", "hls_email_alert",
   "hls_daily_mosaic",
   "hls_feature_space",
+  "hls_water_history",
 ]
 
 [tool.setuptools.dynamic]

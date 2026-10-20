@@ -112,6 +112,13 @@ WantedBy=default.target hls-download-proxy.service
                     '--nas-source',config['nas_source'],'--interval',str(interval),
                     '--grouping',grouping,'--layout',layout,'--watch','--run']
         if fusion:daily_args.append('--fuse-products')
+        wait_network=daily.get('require_network_complete',False)
+        if type(wait_network) is not bool:raise ValueError('require_network_complete must be boolean')
+        if wait_network:daily_args.append('--require-network-complete')
+        water_root=daily.get('water_mask_root')
+        if water_root:
+            if not Path(water_root).is_absolute() or grouping!='region-day':raise ValueError('Water mask root requires an absolute path and region-day')
+            daily_args.extend(['--water-mask-root',water_root])
         units['hls-daily-mosaic.service']=f'''[Unit]
 Description=Verified HLS daily GeoTIFF mosaics
 ConditionHost=master

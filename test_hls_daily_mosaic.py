@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock,patch
 
 import numpy as np
 import rasterio
@@ -16,6 +16,17 @@ import hls_daily_mosaic as m
 
 
 class MosaicTests(unittest.TestCase):
+    def test_network_gate_cannot_treat_completion_hints_as_verification(self):
+        inventory=Mock()
+        region=Mock();region.code='RIS';region.months=[Mock(scene_count=1,start='2020-01-01',end='2020-02-01')]
+        inventory.regions=[region]
+        job=Mock(scene_count=1,name='RIS/month')
+        with patch.object(m.archive,'fair_jobs',return_value=[job]),patch.object(m.archive,'processed_scene_hint',return_value=0):
+            self.assertFalse(m.network_complete(inventory,Path('/archive'),{})[0])
+        cache={'RIS':(None,None)}
+        with patch.object(m.archive,'fair_jobs',return_value=[job]),patch.object(m.archive,'processed_scene_hint',return_value=1),patch.object(m,'load_month',side_effect=m.MonthPending('incomplete')):
+            self.assertFalse(m.network_complete(inventory,Path('/archive'),cache)[0])
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
         self.root=Path(self.temp.name)
@@ -66,11 +77,26 @@ class MosaicTests(unittest.TestCase):
     def save_manifest(self):
         m.atomic_json(self.month/'run_manifest.json',{'recipe':self.recipe,'recipe_hash':self.fingerprint,'scenes':self.scenes})
 
-    def process(self,grouping='track-day',fuse_products=False,layout='region-product'):
+    def process(self,grouping='track-day',fuse_products=False,layout='region-product',water_mask=None):
         cache=Mock();cache.load.side_effect=lambda scenes:{s['id']:self.metadata[s['id']] for s in scenes}
         if grouping=='region-day':cache.load.side_effect=AssertionError('Regional mode must not query EE metadata')
         return m.process_month(self.month,'RIS',self.roi,self.payload,cache,self.root/'daily',len(self.scenes),
-                               emit=lambda _:None,grouping=grouping,fuse_products=fuse_products,layout=layout)
+                               emit=lambda _:None,grouping=grouping,fuse_products=fuse_products,layout=layout,water_mask=water_mask)
+
+    def test_static_water_mask_removes_both_products_and_fused_provenance(self):
+        self.add(blocks=[0]);self.add(sensor='S30',blocks=[0,1],value=.2)
+        mask=self.root/'water_history.tif';values=np.zeros((64,128),dtype='uint8');values[1,1]=1
+        with rasterio.open(mask,'w',driver='GTiff',width=128,height=64,count=1,dtype='uint8',
+                crs='EPSG:32614',transform=Affine(30,0,0,0,-30,1920)) as ds:ds.write(values,1)
+        m.atomic_json(mask.with_suffix('.json'),{'policy':'consecutive-valid-date-water-all-dates-v1',
+            'consecutive_valid_dates':2,'sha256':h.file_hash(mask)})
+        result=self.process('region-day',True,'product-region',mask)
+        for row in result['outputs']:
+            with rasterio.open(row['path']) as ds:self.assertTrue(np.all(ds.read()[:,1,1]==h.NODATA))
+            if '/FUSED/' in row['path'].replace('\\','/'):
+                receipt=m.read_json(Path(row['path']).with_suffix('.json'))
+                with rasterio.open(receipt['provenance_maps']['source']['path']) as ds:self.assertEqual(ds.read(1)[1,1],0)
+                with rasterio.open(receipt['provenance_maps']['time']['path']) as ds:self.assertEqual(ds.read(1)[1,1],m.TIME_NODATA)
 
     def test_product_first_folders_keep_same_day_fusion_and_verified_reuse(self):
         self.add(blocks=[0])

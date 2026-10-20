@@ -11,6 +11,8 @@
 
 `--layout product-region`将日图放入并列的`L30/研究区/年份`、`S30/研究区/年份`、`FUSED/研究区/年份`。下游[样本质控与特征空间对比](docs/feature-space.md)提供物理域检查、绑定原文件校验和的明确审查清单、重新融合和全范围绘图；不会自动删除高STR长尾或改写下载数据。
 
+[历史水体规则](docs/water-history.md)：整网下载完成后，用原始Fmask检查连续两个有效日期标水；云/缺测跳过，陆地打断，满足条件的位置跨所有日期、所有产品统一剔除。`--require-network-complete`及`--water-mask-root`分别控制整网完成与掩膜就绪门槛。
+
 English: resumable HLS v2 OPTRAM archives, Linux cluster scheduling, verified tile downloads, live progress estimates, and adaptive proxy routing. Deployment instructions are currently in Chinese.
 
 ## 功能

@@ -273,7 +273,7 @@ def compose_window(inputs, geometry, tile, recipe_hash, crs, aerosol, validated,
 
 
 def write_group(output, key, scenes, donors, records, footprints, tiles, manifest, month_root,
-                metadata, check=lambda: None, *, roi=None, policy=POLICY):
+                metadata, check=lambda: None, *, roi=None, policy=POLICY,water_mask=None):
     sensor, date, spatial_id = key
     fused=sensor=='FUSED'
     geometry = roi if roi is not None else unary_union([footprints[s['id']] for s in scenes])
@@ -325,6 +325,19 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
         contract['physical_bands']={'L30':{'red':'B4','nir':'B5','swir2':'B7'},
                                     'S30':{'red':'B4','nir':'B8A','swir2':'B12'}}
         contract['fusion']='No averaging, interpolation or extra bandpass adjustment; existing strict QA/NoData requirements apply to both products'
+    if water_mask is not None:
+        water_mask=Path(water_mask);no_symlink(water_mask)
+        water_receipt=read_json(water_mask.with_suffix('.json'))
+        if (water_receipt.get('policy')!='consecutive-valid-date-water-all-dates-v1' or
+                water_receipt.get('consecutive_valid_dates')!=2 or
+                water_receipt.get('sha256')!=hls.file_hash(water_mask)):
+            raise MosaicError('Water-history mask is unverified or uses a different rule')
+        with rasterio.open(water_mask) as mask:
+            if ((mask.width,mask.height,mask.transform,mask.crs)!=(width,height,transform,rasterio.crs.CRS.from_user_input(manifest['recipe']['crs']))
+                    or mask.count!=1 or mask.dtypes[0]!='uint8'):
+                raise MosaicError('Water-history mask must match the complete regional grid')
+        contract['water_exclusion']={'policy':water_receipt['policy'],'mask_sha256':water_receipt['sha256'],
+            'receipt_sha256':hls.file_hash(water_mask.with_suffix('.json')),'scope':'all dates and products'}
     fingerprint = hls.hash_object(contract)
     output = Path(output)
     no_symlink(output)
@@ -363,6 +376,7 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
                     tiled=True,blockxsize=256,blockysize=256,compress='DEFLATE',predictor=3,
                     BIGTIFF='IF_SAFER',NUM_THREADS='1') as destination, ExitStack() as resources:
                 trace_outputs={}
+                exclusion=resources.enter_context(rasterio.open(water_mask)) if water_mask is not None else None
                 for kind,path in trace_temps.items():
                     layer=resources.enter_context(rasterio.open(path,'w',driver='GTiff',width=width,height=height,
                         count=1,dtype='uint8' if kind=='source' else 'uint32',nodata=0 if kind=='source' else TIME_NODATA,
@@ -386,6 +400,13 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
                             manifest['recipe_hash'],recipe['crs'],recipe['aerosol'],validated,check,trace=fused)
                         values,count=result[:2]
                         window = Window(col-min_col,row-min_row,tile.width,tile.height)
+                        if exclusion is not None:
+                            codes_to_remove=exclusion.read(1,window=window)
+                            if not np.all((codes_to_remove==0)|(codes_to_remove==1)):
+                                raise MosaicError('Water-history mask contains invalid codes')
+                            remove=codes_to_remove==1;values[:,remove]=hls.NODATA
+                            count=int(np.count_nonzero(np.all(values!=hls.NODATA,axis=0)))
+                            if fused:result[2][remove]=0;result[3][remove]=TIME_NODATA
                         destination.write(values,window=window)
                         if fused:
                             codes,times=result[2:]
@@ -415,6 +436,10 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
                                 hashlib.sha256(times.read(1,window=window).tobytes()).hexdigest()!=time_hash):
                             raise MosaicError('Fused provenance pixel verification failed')
         check()
+        if water_mask is not None and (
+                hls.file_hash(water_mask)!=contract['water_exclusion']['mask_sha256'] or
+                hls.file_hash(water_mask.with_suffix('.json'))!=contract['water_exclusion']['receipt_sha256']):
+            raise MosaicError('Water-history mask changed during processing')
         digest = hls.file_hash(temporary)
         saved = {'fingerprint':fingerprint,'sha256':digest,'contract':contract,
                  'valid_pixels':valid_pixels,'verified_utc':datetime.now(timezone.utc).isoformat(),
@@ -436,10 +461,11 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
 
 def process_month(directory, region, roi, payload, metadata_cache, output_root,
                   expected_count=None, check=lambda:None, emit=print, *, grouping='track-day',fuse_products=False,
-                  layout='region-product'):
+                  layout='region-product',water_mask=None):
     if grouping not in ('region-day','track-day'):
         raise MosaicError('Unknown daily grouping')
     regional=grouping=='region-day'
+    if water_mask is not None and not regional:raise MosaicError('Water-history mask requires region-day grouping')
     if layout not in ('region-product','product-region'):raise MosaicError('Unknown output layout')
     if fuse_products and not regional:raise MosaicError('Product fusion requires region-day grouping')
     manifest, scenes, records, footprints, tiles = load_month(directory,roi,payload,expected_count)
@@ -470,7 +496,8 @@ def process_month(directory, region, roi, payload, metadata_cache, output_root,
         result = write_group(output,key,members,list(donors.values()),records,footprints,
                              tiles,manifest,Path(directory),metadata,check,
                              roi=roi if regional else None,
-                             policy=FUSION_POLICY if sensor=='FUSED' else REGION_POLICY if regional else POLICY)
+                             policy=FUSION_POLICY if sensor=='FUSED' else REGION_POLICY if regional else POLICY,
+                             water_mask=water_mask)
         if result:
             results.append(result)
             emit(f"日景{'复用' if result['reused'] else '完成'} {output.name}；有效像元 {result['valid_pixels']:,}")
@@ -494,6 +521,9 @@ def parser():
     result.add_argument('--fuse-products',action='store_true',help='Also create L30-first, same-day S30-fill regional TIFFs plus pixel source/time maps')
     result.add_argument('--layout',choices=('region-product','product-region'),default='region-product',
                         help='Use product-region for sibling L30/S30/FUSED folders, each containing region/year')
+    result.add_argument('--require-network-complete',action='store_true',
+                        help='Wait for the entire frozen inventory before processing any region/month')
+    result.add_argument('--water-mask-root',type=Path,help='Require verified REGION/water_history.tif masks before processing')
     result.add_argument('--proxy',default='http://127.0.0.1:8118')
     result.add_argument('--nas-source',required=True,help='Expected CIFS source; verify before reading/writing NAS')
     result.add_argument('--reserve-gib',type=float,default=256)
@@ -503,8 +533,33 @@ def parser():
     return result
 
 
+def network_complete(inventory,source,geometry_cache,check=lambda:None):
+    """Hints can delay work, never authorize it; verify committed scene metadata last."""
+    jobs=archive.fair_jobs(inventory,str(source))
+    for job in jobs:
+        check()
+        if archive.processed_scene_hint(job)!=job.scene_count:return False,job.name
+    for region in inventory.regions:
+        if region.code not in geometry_cache:
+            roi,_,payload=hls.load_roi(region.roi,region.crs);geometry_cache[region.code]=(roi,payload)
+        roi,payload=geometry_cache[region.code]
+        for month in region.months:
+            if not month.scene_count:continue
+            check();directory=Path(source)/region.code/f'{month.start}__{month.end}'
+            try:
+                _,scenes,records,_,_=load_month(directory,roi,payload,month.scene_count)
+                for scene in scenes:
+                    for entry in records[scene['id']]['tiles']:
+                        path=directory/scene['sensor']/scene['index']/entry['file']
+                        no_symlink(path)
+                        if not path.is_file() or not path.with_suffix('.json').is_file():return False,str(directory)
+            except (MosaicError,FileNotFoundError,KeyError,ValueError):return False,str(directory)
+    return True,None
+
+
 def main(argv=None):
     args=parser().parse_args(argv)
+    if args.water_mask_root and args.grouping!='region-day':raise SystemExit('Water masks require region-day')
     if args.fuse_products and args.grouping!='region-day':raise SystemExit('Fusion requires --grouping region-day')
     if (args.month and not MONTH_RE.fullmatch(args.month)) or not 30<=args.interval<=86400:
         raise SystemExit('Invalid month or polling interval')
@@ -547,6 +602,7 @@ def main(argv=None):
     previous={sig:signal.signal(sig,lambda *_:stopped.set()) for sig in (signal.SIGTERM,signal.SIGINT)}
     cache=MetadataCache(args.state_root/'catalog',args.project,args.proxy)
     geometry_cache={}
+    network_verified=False
     try:
         with cluster.output_lock(str(output),args.state_root):
             while True:
@@ -556,6 +612,24 @@ def main(argv=None):
                                      capture_output=True,text=True,check=True,timeout=10).stdout
                 if not any(row.split()==[args.nas_source,'cifs'] for row in mount.splitlines()):
                     raise MosaicError('NAS mount source mismatch')
+                if args.require_network_complete and not network_verified:
+                    network_verified,waiting=network_complete(inventory,source,geometry_cache,check)
+                    if not network_verified:
+                        atomic_json(args.state_root/'status.json',{'phase':'waiting-for-entire-network',
+                            'waiting_for':waiting,'output_root':str(output),
+                            'updated_utc':datetime.now(timezone.utc).isoformat()})
+                        print('等待整个网络下载完成；不生成日图：'+str(waiting),flush=True)
+                        if not args.watch:return 1
+                        stopped.wait(args.interval);continue
+                masks={r.code:args.water_mask_root/r.code/'water_history.tif' for r in regions} if args.water_mask_root else {}
+                missing=[r for r,p in masks.items() if not p.is_file() or not p.with_suffix('.json').is_file()]
+                if missing:
+                    atomic_json(args.state_root/'status.json',{'phase':'waiting-for-original-Fmask-history',
+                        'regions':missing,'output_root':str(output)})
+                    print('等待完整原始Fmask历史掩膜：'+','.join(missing),flush=True)
+                    if not args.watch:return 1
+                    stopped.wait(args.interval);continue
+                mask_hashes={r:hls.file_hash(p) for r,p in masks.items()}
                 pending,completed,failed=0,[],[]
                 last_region=None
                 for region,month in jobs:
@@ -572,6 +646,7 @@ def main(argv=None):
                         saved=read_json(receipt)
                         if (saved.get('policy')!=policy or saved.get('output_root')!=str(output) or
                                 saved.get('layout','region-product')!=args.layout or
+                                saved.get('water_mask_sha256')!=mask_hashes.get(region.code) or
                                 saved.get('manifest_sha256')!=hls.file_hash(directory/'run_manifest.json')):
                             raise MosaicError('Completed month receipt conflicts with source/output')
                         completed.append({'region':region.code,**saved})
@@ -583,8 +658,8 @@ def main(argv=None):
                         roi,payload=geometry_cache[region.code]
                         result=process_month(directory,region.code,roi,payload,cache,output,month.scene_count,check,
                                              lambda value:print(value,flush=True),grouping=args.grouping,
-                                             fuse_products=args.fuse_products,layout=args.layout)
-                        result.update(policy=policy,output_root=str(output),layout=args.layout)
+                                             fuse_products=args.fuse_products,layout=args.layout,water_mask=masks.get(region.code))
+                        result.update(policy=policy,output_root=str(output),layout=args.layout,water_mask_sha256=mask_hashes.get(region.code))
                         atomic_json(receipt,result)
                         completed.append({'region':region.code,**result})
                     except MonthPending:

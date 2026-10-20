@@ -42,6 +42,7 @@ class ProjectToolsTests(unittest.TestCase):
         self.assertIn('CPUQuota=50%',daily)
         self.assertIn('"--grouping" "region-day"',daily)
         self.assertIn('"--fuse-products"',daily)
+        self.assertIn('"--require-network-complete"',daily)
         changed=render(dict(config,daily_mosaic=dict(config['daily_mosaic'],layout='product-region')),root)
         self.assertIn('"--layout" "product-region"',changed['hls-daily-mosaic.service'])
         with self.assertRaises(ValueError):render(dict(config,daily_mosaic=dict(config['daily_mosaic'],layout='unknown')),root)

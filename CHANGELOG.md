@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add a full-network completion gate and a verified, fixed-grid historical water mask required before daily processing.
+- Add two-consecutive-valid-UTC-date water exclusion, skipping clouds/missing dates, resetting on land and deduplicating same-day sensors; apply the static mask to every product/date and fused provenance.
+
 - Add product-first daily folders (`--layout product-region`) while retaining the existing layout and scientific recipe by default.
 - Add offline sample model-domain QC, checksum-bound reviewed exclusions, whole-pixel re-fusion and optional core/full-range NDVI–STR plots.
 
