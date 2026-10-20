@@ -26,7 +26,7 @@ PHASES={'checking-region-download':'核验完整研究区','region-download-veri
  'generating-daily-mosaics':'生成正式日图','waiting-for-region-download':'等待该区下载完整',
  'waiting-for-entire-network':'等待下载','watching':'等待下一轮检查','region-scan':'检查研究区',
  'completed':'已完成','blocked':'受阻，需查看原因'}
-ACTIVE={'active':'运行','inactive':'已停用','failed':'失败','activating':'启动/重试','deactivating':'正在停止'}
+ACTIVE={'active':'运行','inactive':'未运行','failed':'失败','activating':'启动/重试','deactivating':'正在停止'}
 
 
 def scrub(value):
@@ -169,7 +169,8 @@ def validate(config):
 class Collector:
     def __init__(self,config):
         validate(config);self.config=config;self.lock=threading.Lock();self.stop=threading.Event()
-        self.data={'hosts':{},'services':[],'qa':{},'archive':{},'events':[], 'messages':[],'regions':{}}
+        self.data={'hosts':{},'services':[],'qa':{},'archive':{},'events':[], 'messages':[],'regions':{},
+                   'archive_service':config.get('archive_service','hls-archive.service')}
         self.threads=[];self.cursor=None;self.qa_rates={};self.event_rows=deque(maxlen=200)
 
     def put(self,**values):
@@ -202,6 +203,7 @@ class Collector:
                     '-o','ServerAliveCountMax=1',host,shlex.join([python,script,'--host-probe'])],timeout=12)
                 value=json.loads(raw)
                 if not isinstance(value.get('processes'),list):raise ValueError('Invalid host probe')
+                value['received_at']=time.time()  # Host clocks may differ; freshness uses local reception.
                 self.host(host,value)
             except (OSError,ValueError,RuntimeError,subprocess.TimeoutExpired):
                 self.host(host,{'error':'SSH暂不可用；不影响该节点后台任务','timestamp':time.time()})
@@ -304,14 +306,14 @@ def overview(data):
         if not row:lines.append(f'  {host:<7} 正在读取…');continue
         if row.get('error'):lines.append(f"  {host:<7} {row['error']}");continue
         cpu='采样中' if row.get('cpu') is None else f"{row['cpu']:.1f}%"
-        age=max(0,int(time.time()-row.get('timestamp',time.time())))
+        age=max(0,int(time.time()-row.get('received_at',row.get('timestamp',time.time()))))
         lines.append(f"  {host:<7} CPU {cpu:>7} / {row.get('cores','?')}核  内存 {row['memory_used']/2**30:.1f}/{row['memory_total']/2**30:.1f} GiB  进程 {len(row['processes'])}  更新{age}秒前")
     lines.extend(['','后台任务'])
     units={row.get('unit'):row for row in data.get('services',[]) if row.get('scope')=='当前用户'}
-    for label,unit in [('日图及QA','hls-auto-daily.service'),('下载归档',data.get('archive',{}).get('service_name','')),
+    for label,unit in [('日图及QA','hls-auto-daily.service'),('下载归档',data.get('archive_service','hls-archive.service')),
                        ('下载代理','hls-download-proxy.service'),('节点择优','hls-node-optimizer.service')]:
         if label=='下载归档':
-            state=data.get('archive',{}).get('service',{}).get('active')
+            state=data.get('archive',{}).get('service',{}).get('active') or units.get(unit,{}).get('active')
         else:state=units.get(unit,{}).get('active')
         lines.append(f"  {label:<6} [{ACTIVE.get(state,'读取中')}]")
     lines.append('  当前代理节点：'+str(data.get('route',{}).get('selected') or '状态载入中'))
@@ -337,7 +339,10 @@ def overview(data):
         row=data.get('regions',{}).get(region,{})
         done,total=row.get('completed_days'),row.get('total_days')
         amount=f'{done}/{total}' if type(done) is int and total else '尚未建立清单'
-        lines.append(f"  {region:<7} {amount:<18} {counts.get(region,'—')!s:<10} {PHASES.get(row.get('phase'),row.get('phase','等待下载/核验'))}")
+        stage=PHASES.get(row.get('phase'),row.get('phase','等待下载/核验'))
+        if row.get('phase')=='blocked' and qa.get('region')!=region:stage='上次受阻，待重试'
+        delivered=counts.get(region,0) if 'daily_counts' in data else '读取中'
+        lines.append(f"  {region:<7} {amount:<18} {delivered!s:<10} {stage}")
     current=qa.get('region');row=data.get('regions',{}).get(current,{})
     if row.get('total_days'):
         lines.append('  '+str(current)+' QA '+progress_bar(row.get('completed_days',0),row['total_days']))
@@ -384,13 +389,16 @@ def view_lines(data,tab,query='',sort='cpu'):
 
 
 def screen(collector):
+    if os.environ.get('TERM') in (None,'','dumb'):os.environ['TERM']='xterm-256color'
     import curses
     def ui(stdscr):
         try:curses.curs_set(0)
         except curses.error:pass
         color=0
         if curses.has_colors():
-            curses.start_color();curses.use_default_colors();curses.init_pair(1,curses.COLOR_CYAN,-1);color=curses.color_pair(1)
+            try:
+                curses.start_color();curses.use_default_colors();curses.init_pair(1,curses.COLOR_CYAN,-1);color=curses.color_pair(1)
+            except curses.error:pass
         stdscr.timeout(200);tab=1;offset=0;query='';entering=False;sort='cpu';last=0;paused=False;cached={};detail=None
         while True:
             if not paused:cached=collector.snapshot()
@@ -413,7 +421,7 @@ def screen(collector):
                 stdscr.erase()
                 header=f'Linux任务总览  {datetime.now().astimezone():%m-%d %H:%M:%S}  '+('【画面暂停，后台任务继续】' if paused else '只读监控')
                 title='1 总览 | 2 全部进程/命令 | 3 服务 | 4 用户 | 5 事件'
-                footer=('搜索：'+query if entering else f'↑↓滚动 PgDn翻页 /搜索 c按CPU m按内存 Enter查看页首命令 空格暂停 q退出 {offset+1}/{max(1,len(lines))}')
+                footer=('搜索：'+query if entering else f'q退出 ↑↓/PgDn翻页 /搜索 回车详情 c/m排序 空格暂停 {offset+1}/{max(1,len(lines))}')
                 for y,text,attr in [(0,header,curses.A_BOLD|color),(1,title,curses.A_REVERSE),
                                     *[(i+2,line,0) for i,line in enumerate(lines[offset:offset+body])],(height-1,footer,curses.A_REVERSE)]:
                     if 0<=y<height:
