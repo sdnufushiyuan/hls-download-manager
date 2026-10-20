@@ -17,6 +17,8 @@
 
 English: resumable HLS v2 OPTRAM archives, Linux cluster scheduling, verified tile downloads, live progress estimates, and adaptive proxy routing. Deployment instructions are currently in Chinese.
 
+查看Linux全部任务时，可用[中文实时监控面板](docs/monitor.md)：同屏查看master/node1/node2资源、所有可见用户的进程与命令、服务、下载、QA和日图阶段；支持搜索、翻页、完整命令详情与CPU/内存排序，退出不影响后台任务。
+
 ## 功能
 
 - HLS L30 / S30，保留每次观测，输出30米的red、nir、swir2、NDVI、STR、Fmask六波段GeoTIFF。

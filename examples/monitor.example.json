@@ -1,0 +1,12 @@
+{
+  "program_root": "/opt/hls-download-manager",
+  "python": "/opt/hls-download-manager/.venv/bin/python",
+  "archive_run_root": "/opt/hls-download-manager/runs/archive",
+  "archive_output_root": "/nasdata/HLS/archive",
+  "archive_service": "hls-archive.service",
+  "auto_state_root": "/opt/hls-download-manager/runs/auto-daily",
+  "auto_service": "hls-auto-daily.service",
+  "daily_output_root": "/nasdata/HLS/daily",
+  "nas_source": "//NAS_HOST/data",
+  "hosts": ["node1", "node2"]
+}

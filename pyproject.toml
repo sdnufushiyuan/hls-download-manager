@@ -34,6 +34,7 @@ hls-daily-mosaic = "hls_daily_mosaic:main"
 hls-feature-space = "hls_feature_space:main"
 hls-water-history = "hls_water_history:main"
 hls-auto-daily = "hls_auto_daily:main"
+hls-monitor = "hls_system_monitor:main"
 
 [tool.setuptools]
 py-modules = [
@@ -44,6 +45,7 @@ py-modules = [
   "hls_feature_space",
   "hls_water_history",
   "hls_auto_daily",
+  "hls_system_monitor",
 ]
 
 [tool.setuptools.dynamic]

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add a read-only Chinese terminal monitor for master/node1/node2, visible processes and commands across users, services, resource usage and separate archive/QA/daily progress, with search, paging and credential redaction.
+
 - Keep transient original-QA transfer failures within the current chunk with bounded backoff, refreshed download URLs and safe numeric HTTP diagnostics; explicitly test proxy routing despite environment bypass settings.
 
 - Support explicit, reasoned per-region month exclusions consistently across download-readiness checks, original-QA history and daily output; preserve the original frozen inventory and source data.
