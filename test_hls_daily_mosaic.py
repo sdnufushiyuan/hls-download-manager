@@ -66,11 +66,23 @@ class MosaicTests(unittest.TestCase):
     def save_manifest(self):
         m.atomic_json(self.month/'run_manifest.json',{'recipe':self.recipe,'recipe_hash':self.fingerprint,'scenes':self.scenes})
 
-    def process(self,grouping='track-day',fuse_products=False):
+    def process(self,grouping='track-day',fuse_products=False,layout='region-product'):
         cache=Mock();cache.load.side_effect=lambda scenes:{s['id']:self.metadata[s['id']] for s in scenes}
         if grouping=='region-day':cache.load.side_effect=AssertionError('Regional mode must not query EE metadata')
         return m.process_month(self.month,'RIS',self.roi,self.payload,cache,self.root/'daily',len(self.scenes),
-                               emit=lambda _:None,grouping=grouping,fuse_products=fuse_products)
+                               emit=lambda _:None,grouping=grouping,fuse_products=fuse_products,layout=layout)
+
+    def test_product_first_folders_keep_same_day_fusion_and_verified_reuse(self):
+        self.add(blocks=[0])
+        self.add(sensor='S30',blocks=[1],value=.2)
+        result=self.process('region-day',True,'product-region')
+        self.assertEqual(result['groups'],3)
+        for row in result['outputs']:
+            path=Path(row['path'])
+            self.assertIn(path.relative_to(self.root/'daily').parts[0],('L30','S30','FUSED'))
+            self.assertEqual(path.relative_to(self.root/'daily').parts[1:3],('RIS','2013'))
+        self.assertEqual(self.process('region-day',True,'product-region')['groups'],3)
+        with self.assertRaises(m.MosaicError):self.process('region-day',True,'unknown')
 
     def test_regional_day_crosses_wrs_and_mgrs_and_does_not_query_ee(self):
         self.add(blocks=[0],footprint=box(0,0,1920,1920))

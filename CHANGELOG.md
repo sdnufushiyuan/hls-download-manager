@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add product-first daily folders (`--layout product-region`) while retaining the existing layout and scientific recipe by default.
+- Add offline sample model-domain QC, checksum-bound reviewed exclusions, whole-pixel re-fusion and optional core/full-range NDVI–STR plots.
+
 - Default daily mosaics to full-region, fixed-grid UTC-day images across HLS tiles, keeping L30/S30 separate without metadata network requests.
 - Add optional same-day L30-first/S30-fill fusion with whole six-band pixels and verified source/acquisition-time rasters.
 

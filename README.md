@@ -9,6 +9,8 @@
 
 需要整图做NDVI–STR等特征空间分析时，可开启[按日整图处理](docs/daily-mosaics.md)：每个研究区、每天、每个产品输出一个固定范围的六波段TIFF，跨HLS瓦片拼接，L30/S30分别保留。还可额外生成同日L30优先、S30补缺的融合TIFF及像元来源/时刻图。独立后台任务处理已完成月份，保留下载块和进度；整图交付状态单独记录。
 
+`--layout product-region`将日图放入并列的`L30/研究区/年份`、`S30/研究区/年份`、`FUSED/研究区/年份`。下游[样本质控与特征空间对比](docs/feature-space.md)提供物理域检查、绑定原文件校验和的明确审查清单、重新融合和全范围绘图；不会自动删除高STR长尾或改写下载数据。
+
 English: resumable HLS v2 OPTRAM archives, Linux cluster scheduling, verified tile downloads, live progress estimates, and adaptive proxy routing. Deployment instructions are currently in Chinese.
 
 ## 功能

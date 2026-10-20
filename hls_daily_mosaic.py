@@ -435,10 +435,12 @@ def write_group(output, key, scenes, donors, records, footprints, tiles, manifes
 
 
 def process_month(directory, region, roi, payload, metadata_cache, output_root,
-                  expected_count=None, check=lambda:None, emit=print, *, grouping='track-day',fuse_products=False):
+                  expected_count=None, check=lambda:None, emit=print, *, grouping='track-day',fuse_products=False,
+                  layout='region-product'):
     if grouping not in ('region-day','track-day'):
         raise MosaicError('Unknown daily grouping')
     regional=grouping=='region-day'
+    if layout not in ('region-product','product-region'):raise MosaicError('Unknown output layout')
     if fuse_products and not regional:raise MosaicError('Product fusion requires region-day grouping')
     manifest, scenes, records, footprints, tiles = load_month(directory,roi,payload,expected_count)
     if regional:
@@ -463,7 +465,8 @@ def process_month(directory, region, roi, payload, metadata_cache, output_root,
                   if regional or key[0]=='S30' or identity(s,metadata[s['id']])==key}
         sensor,date,spatial_id = key
         suffix='' if regional else '_'+spatial_id
-        output = Path(output_root)/region/sensor/date[:4]/f'{region}_{sensor}_{date}{suffix}.tif'
+        parts=(region,sensor) if layout=='region-product' else (sensor,region)
+        output = Path(output_root).joinpath(*parts,date[:4],f'{region}_{sensor}_{date}{suffix}.tif')
         result = write_group(output,key,members,list(donors.values()),records,footprints,
                              tiles,manifest,Path(directory),metadata,check,
                              roi=roi if regional else None,
@@ -489,6 +492,8 @@ def parser():
     result.add_argument('--grouping',choices=('region-day','track-day'),default='region-day',
                         help='Default: one fixed-extent regional TIFF per UTC day and product; legacy track-day is opt-in')
     result.add_argument('--fuse-products',action='store_true',help='Also create L30-first, same-day S30-fill regional TIFFs plus pixel source/time maps')
+    result.add_argument('--layout',choices=('region-product','product-region'),default='region-product',
+                        help='Use product-region for sibling L30/S30/FUSED folders, each containing region/year')
     result.add_argument('--proxy',default='http://127.0.0.1:8118')
     result.add_argument('--nas-source',required=True,help='Expected CIFS source; verify before reading/writing NAS')
     result.add_argument('--reserve-gib',type=float,default=256)
@@ -520,7 +525,7 @@ def main(argv=None):
           (args.month is None or f'{month.start}__{month.end}'==args.month)]
     print(json.dumps({'policy':policy,'source_root':str(source),'output_root':str(output),
                       'region_order':[r.code for r in regions],'months':len(jobs),
-                      'grouping':args.grouping,'fuse_products':args.fuse_products,
+                      'grouping':args.grouping,'fuse_products':args.fuse_products,'layout':args.layout,
                       'mode':'run' if args.run else 'plan'},ensure_ascii=False),flush=True)
     if not args.run:
         return 0
@@ -566,6 +571,7 @@ def main(argv=None):
                     if receipt.exists():
                         saved=read_json(receipt)
                         if (saved.get('policy')!=policy or saved.get('output_root')!=str(output) or
+                                saved.get('layout','region-product')!=args.layout or
                                 saved.get('manifest_sha256')!=hls.file_hash(directory/'run_manifest.json')):
                             raise MosaicError('Completed month receipt conflicts with source/output')
                         completed.append({'region':region.code,**saved})
@@ -577,8 +583,8 @@ def main(argv=None):
                         roi,payload=geometry_cache[region.code]
                         result=process_month(directory,region.code,roi,payload,cache,output,month.scene_count,check,
                                              lambda value:print(value,flush=True),grouping=args.grouping,
-                                             fuse_products=args.fuse_products)
-                        result.update(policy=policy,output_root=str(output))
+                                             fuse_products=args.fuse_products,layout=args.layout)
+                        result.update(policy=policy,output_root=str(output),layout=args.layout)
                         atomic_json(receipt,result)
                         completed.append({'region':region.code,**result})
                     except MonthPending:

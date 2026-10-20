@@ -103,12 +103,14 @@ WantedBy=default.target hls-download-proxy.service
         grouping=daily.get('grouping','region-day')
         if grouping not in ('region-day','track-day'):raise ValueError('Unknown daily grouping')
         fusion=daily.get('fuse_products',False)
+        layout=daily.get('layout','region-product')
+        if layout not in ('region-product','product-region'):raise ValueError('Unknown daily output layout')
         if type(fusion) is not bool or (fusion and grouping!='region-day'):raise ValueError('Fusion requires region-day grouping')
         if type(interval) is not int or not 30<=interval<=86400:raise ValueError('Daily interval must be 30–86400')
         daily_args=[python,'-u',root/'hls_daily_mosaic.py','--inventory',run/'inventory.json',
                     '--source-root',source,'--output-root',daily_out,'--state-root',daily_state,
                     '--nas-source',config['nas_source'],'--interval',str(interval),
-                    '--grouping',grouping,'--watch','--run']
+                    '--grouping',grouping,'--layout',layout,'--watch','--run']
         if fusion:daily_args.append('--fuse-products')
         units['hls-daily-mosaic.service']=f'''[Unit]
 Description=Verified HLS daily GeoTIFF mosaics

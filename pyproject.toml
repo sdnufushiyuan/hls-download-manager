@@ -22,12 +22,16 @@ classifiers = [
 Repository = "https://github.com/sdnufushiyuan/hls-download-manager"
 Issues = "https://github.com/sdnufushiyuan/hls-download-manager/issues"
 
+[project.optional-dependencies]
+analysis = ["matplotlib>=3.8"]
+
 [project.scripts]
 hls-download = "download_hls_optram:main"
 hls-archive = "run_hls_archive:main"
 hls-progress = "watch_hls_progress:main"
 hls-node-optimize = "hls_node_optimizer:main"
 hls-daily-mosaic = "hls_daily_mosaic:main"
+hls-feature-space = "hls_feature_space:main"
 
 [tool.setuptools]
 py-modules = [
@@ -35,6 +39,7 @@ py-modules = [
   "run_hls_archive", "hls_progress_state", "hls_progress_rates", "watch_hls_progress",
   "hls_node_optimizer", "hls_email_alert",
   "hls_daily_mosaic",
+  "hls_feature_space",
 ]
 
 [tool.setuptools.dynamic]
