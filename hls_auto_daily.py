@@ -296,6 +296,7 @@ def run_cycle(config, paths, check, progress):
                 verify_mask(Path(saved['mask']), saved['result']['history_sha256'])
                 results[region.code] = saved['result']
                 continue
+            progress('checking-region-download', region=region.code, regions=results)
             ready, waiting = region_ready(inventory, region, paths['source_root'], check)
             if not ready:
                 results[region.code] = {'phase': 'waiting-for-region-download', 'waiting_for': waiting}

@@ -58,7 +58,7 @@ class AutoDailyTests(unittest.TestCase):
             root = Path(tmp); source = root/'inventory.json'; source.write_text('{}')
             paths = dict(inventory=source, source_root=root/'archive', state_root=root/'state',
                          output_root=root/'out', water_root=root/'water')
-            calls = []
+            calls, stages = [], []
             def gate(inv, region, *args):
                 calls.append(region.code)
                 if region.code == 'RIS': raise ValueError('source count differs')
@@ -66,8 +66,10 @@ class AutoDailyTests(unittest.TestCase):
             with patch.object(auto.a, 'read_inventory', return_value=inventory), \
                     patch.object(auto, 'region_ready', side_effect=gate), \
                     patch.object(auto, 'prepare_history', side_effect=ValueError('raw QA missing')) as prepare:
-                result = auto.run_cycle({'nas_source':'//nas/data'}, paths, lambda: None, lambda *a, **kw: None)
+                result = auto.run_cycle({'nas_source':'//nas/data'}, paths, lambda: None,
+                                        lambda phase, **values: stages.append((phase,values)))
             self.assertEqual(calls, ['RIS','TXS','REM'])
+            self.assertEqual([values['region'] for phase,values in stages if phase=='checking-region-download'],calls)
             self.assertEqual(prepare.call_args.args[0].code, 'TXS')
             self.assertEqual(result['RIS']['phase'], 'blocked')
             self.assertEqual(result['REM']['phase'], 'waiting-for-region-download')
