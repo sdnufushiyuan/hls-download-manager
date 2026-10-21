@@ -394,7 +394,16 @@ def overview(data):
     daily=data.get('daily_counts',{})
     lines.append('  完成月已交付日图：'+ '  '.join(f'{p} {daily.get(p,0)}张' for p in ['L30','S30','FUSED']))
     lines.append('  QA一组=同日期同产品；当前月正在写入的日图待该月核验后计入。')
-    lines.append('  RIS后处理已排除2026年10月分片；旧试算图不计入正式结果。')
+    scope_records=[qa,*data.get('regions',{}).values(),*qa.get('regions',{}).values()]
+    exclusions=set()
+    for status in scope_records:
+        for field in ('excluded_months','authorized_scope_exclusions'):
+            for item in status.get(field,[]):
+                month=item.get('month') if isinstance(item,dict) else None
+                if (isinstance(month,str) and re.fullmatch(r'(RIS|TXS|REM|OZN|SDR|MES)/\d{4}-\d{2}-\d{2}__\d{4}-\d{2}-\d{2}',month)):
+                    exclusions.add(month)
+    if exclusions:lines.append('  后处理已排除：'+'；'.join(sorted(exclusions)))
+    lines.append('  旧试算图不计入正式结果。')
     nas=data.get('nas',{})
     lines.append('  NAS：'+(f"已挂载；剩余 {nas['free']/2**40:.2f} TiB" if nas.get('mounted') else '状态载入中/挂载待确认'))
     lines.extend(['','当前最占CPU的命令（各主机、所有可见用户）'])

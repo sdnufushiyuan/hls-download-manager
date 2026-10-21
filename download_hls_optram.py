@@ -83,6 +83,91 @@ def get_download_url(image, parameters, url_lock=None, cancel_event=None):
         url_lock.release()
 
 
+def ee_http_category(error):
+    """Classify a buffered Google error; never return its message or URL.
+
+    When HTTP 400 carries a known compute failure, inspect its category too.
+    Invalid input, memory limits and permission failures stay fatal.
+    """
+    status = getattr(getattr(error, 'resp', None), 'status', None)
+    if status in (401, 403):
+        return 'authorization'
+    if status == 404:
+        return 'asset-not-found'
+    if status == 429:
+        return 'quota-or-rate-limit'
+    if status in (408, 425, 500, 502, 503, 504):
+        return 'server-transient'
+    if status != 400:
+        return 'http-error'
+    try:
+        raw = error.content
+        if not isinstance(raw, (bytes, str)) or len(raw) > 32768:
+            return 'invalid-request'
+        detail = json.loads(raw).get('error', {})
+        if not isinstance(detail, dict):
+            return 'invalid-request'
+        message = detail.get('message', '')
+        if not isinstance(message, str):
+            return 'invalid-request'
+        message = message.strip().lower()
+        if re.match(r'^(?:earth engine internal error|internal error|an internal error has occurred)\b', message):
+            return 'ee-internal'
+        if re.match(r'^computation timed out\b', message):
+            return 'ee-compute-timeout'
+        if re.match(r'^too many concurrent (?:aggregations|requests)\b', message):
+            return 'ee-concurrency-limit'
+        if detail.get('status') == 'RESOURCE_EXHAUSTED' and 'memory' not in message:
+            return 'quota-or-rate-limit'
+        if 'memory limit exceeded' in message:
+            return 'ee-memory-limit'
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return 'invalid-request'
+
+
+EE_TRANSIENT_CATEGORIES = frozenset(('ee-internal', 'ee-compute-timeout',
+                                   'ee-concurrency-limit', 'quota-or-rate-limit'))
+
+
+def error_diagnostic(error):
+    """Return bounded numeric/enum fields, never raw errors, tokens or URLs."""
+    import requests
+    import ssl
+    from google.auth.exceptions import DefaultCredentialsError, RefreshError
+    from googleapiclient.errors import HttpError
+    if (isinstance(error, OSError) and isinstance(getattr(error, 'errno', None), int) and
+            not isinstance(error, (requests.exceptions.RequestException, ssl.SSLError))):
+        return f'http_status=none category=filesystem errno={error.errno}'
+    pending, seen, http = [error], set(), []
+    while pending and len(seen) < 12:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (DefaultCredentialsError, RefreshError)):
+            return 'http_status=none category=credentials'
+        if isinstance(current, HttpError):
+            status = getattr(current.resp, 'status', None)
+            if type(status) is int:
+                http.append((status, ee_http_category(current)))
+        elif isinstance(current, requests.exceptions.HTTPError) and current.response is not None:
+            status = current.response.status_code
+            if type(status) is int:
+                category = ('authorization' if status in (401, 403) else
+                            'quota-or-rate-limit' if status == 429 else
+                            'server-transient' if status in (408, 425, 500, 502, 503, 504) else 'http-error')
+                http.append((status, category))
+        pending.extend(x for x in (current.__cause__, current.__context__) if x is not None)
+    if http:
+        status, category = next((x for x in http if x[0] in (401, 403)), http[0])
+        return f'http_status={status} category={category}'
+    if isinstance(error, ssl.SSLError):
+        category = 'tls-certificate' if isinstance(error, ssl.SSLCertVerificationError) else 'tls'
+        return f'http_status=none category={category}'
+    return 'http_status=none category=opaque-error'
+
+
 def is_transient_error(error):
     """Classify transport errors without reading/logging credential-bearing text.
 
@@ -130,7 +215,9 @@ def is_transient_error(error):
         elif isinstance(current, HttpError):
             status = getattr(current.resp, "status", None)
         if status is not None:
-            if status not in (408, 425, 429, 500, 502, 503, 504):
+            compute_retry = (isinstance(current, HttpError) and status == 400 and
+                             ee_http_category(current) in EE_TRANSIENT_CATEGORIES)
+            if status not in (408, 425, 429, 500, 502, 503, 504) and not compute_retry:
                 return False
             transient = True
         elif isinstance(current, network_types):
@@ -799,26 +886,27 @@ def download_tile(image, tile, path, crs, session, guard, recipe_hash, aerosol, 
             # Raw errors may contain credential-bearing signed URLs; print only the class.
             transient = remote_phase and is_transient_error(error)
             opaque_ee = remote_phase and not transient and is_opaque_ee_error(error)
+            diagnostic = error_diagnostic(error)
             if opaque_ee and not opaque_ee_retry_used and attempt < attempts - 1:
                 opaque_ee_retry_used = True
                 delay = TRANSFER_RETRY_DELAYS[0]
-                print(f"  Earth Engine 请求异常（{type(error).__name__}），等待 {delay} 秒后仅重试一次", flush=True)
+                print(f"  Earth Engine 请求异常（{type(error).__name__}；{diagnostic}），等待 {delay} 秒后仅重试一次", flush=True)
                 if cancel_event is None:
                     time.sleep(delay)
                 elif cancel_event.wait(delay):
                     raise DownloadCancelled("网络等待期间当前景已取消，已校验文件保留。") from None
                 continue
             if opaque_ee:
-                raise TransientDownloadError("Earth Engine 请求异常（EEException），暂按临时网络故障等待恢复。"
+                raise TransientDownloadError(f"Earth Engine 请求异常（EEException；{diagnostic}），暂按临时网络故障等待恢复。"
                                              "已校验的块保留；若持续出现，请检查服务日志。") from None
             if not transient:
-                raise DownloadError(f"请求或文件处理失败（{type(error).__name__}），已停止。"
+                raise DownloadError(f"请求或文件处理失败（{type(error).__name__}；{diagnostic}），已停止。"
                                     "已校验的块会保留；请检查日志、NAS及请求参数。") from None
             if attempt == attempts - 1:
-                raise TransientDownloadError(f"块传输暂时失败（{type(error).__name__}），已尝试{attempts}次。"
+                raise TransientDownloadError(f"块传输暂时失败（{type(error).__name__}；{diagnostic}），已尝试{attempts}次。"
                                              "网络恢复后可继续已完成块。") from None
             delay = TRANSFER_RETRY_DELAYS[attempt]
-            print(f"  网络暂时中断（{type(error).__name__}），等待 {delay} 秒后重试 {attempt + 1}/{attempts-1}", flush=True)
+            print(f"  网络暂时中断（{type(error).__name__}；{diagnostic}），等待 {delay} 秒后重试 {attempt + 1}/{attempts-1}", flush=True)
             if cancel_event is None:
                 time.sleep(delay)
             elif cancel_event.wait(delay):
@@ -895,6 +983,8 @@ class TileDownloadPool:
             prefix = f"{scene['sensor']}/{scene['index']}/{tiles[index].name}："
             if isinstance(error, TransientDownloadError):
                 return TransientDownloadError(prefix + str(error))
+            if isinstance(error, TransientStorageError):
+                return TransientStorageError(prefix + str(error))
             if isinstance(error, DownloadError):
                 return DownloadError(prefix + str(error))
             # Unexpected errors may include signed URLs; keep only the class.

@@ -108,6 +108,15 @@ class MonitorTests(unittest.TestCase):
         self.assertIn('228/1816',text);self.assertIn('L30 0张',text)
         self.assertIn('旧试算图不计入',text)
 
+    def test_scope_banner_uses_explicit_region_exclusions_instead_of_hardcoded_RIS(self):
+        excluded={'month':'REM/2026-10-01__2026-10-10','reason':'explicit user scope'}
+        value={'qa':{'phase':'watching','regions':{'REM':{'authorized_scope_exclusions':[excluded]}}},
+               'regions':{'REM':{'excluded_months':[excluded]}}}
+        text='\n'.join(monitor.overview(value))
+        self.assertEqual(text.count(excluded['month']),1)
+        self.assertNotIn('RIS后处理已排除',text)
+        self.assertIn('旧试算图不计入',text)
+
     def test_only_configured_project_node_aliases_are_probed(self):
         config=dict(program_root='/opt/hls',archive_run_root='/opt/hls/run',archive_output_root='/nasdata/archive',
                     auto_state_root='/opt/hls/auto',daily_output_root='/nasdata/daily',nas_source='//NAS_HOST/data',hosts=['node1'])

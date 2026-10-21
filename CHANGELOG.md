@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Preserve storage-recovery exceptions through the tile pool; log safe HTTP categories and apply bounded retries to explicitly identified EE compute failures while retaining terminal input/authentication protections.
+
 - Label active months with complete download hints as checkpoint verification/reuse; avoid presenting every active monthly process as fresh downloading.
 
 - Retry verified NAS atomic replacements with bounded backoff when CIFS readers temporarily deny rename; preserve mount checks and distinguish storage exit 76 from terminal errors. Resume the same monthly task and let systemd retry exhausted temporary failures.
