@@ -292,8 +292,9 @@ def qa_session(proxy):
 
 def download_chunk(image,tile,path,crs,session,contract,check,report=None):
     delays=(5,15,30)
+    url_state = {}  # Reuse only within this bounded transfer; never persist URLs.
     for attempt in range(len(delays)+1):
-        try:return _download_chunk_once(image,tile,path,crs,session,contract,check)
+        try:return _download_chunk_once(image,tile,path,crs,session,contract,check,url_state)
         except InterruptedError:raise
         except Exception as error:
             if not qa_transient(error) or attempt==len(delays):raise
@@ -306,7 +307,7 @@ def download_chunk(image,tile,path,crs,session,contract,check,report=None):
             retry_wait(delay,check)
 
 
-def _download_chunk_once(image, tile, path, crs, session, contract, check):
+def _download_chunk_once(image, tile, path, crs, session, contract, check, url_state=None):
     if cached(path, contract):
         inspect_qa(path, tile.width, tile.height, Affine(*tile.transform), crs)
         return
@@ -319,7 +320,11 @@ def _download_chunk_once(image, tile, path, crs, session, contract, check):
         check()
         # EE's getDownloadURL mutates its params dict by adding an Image object.
         # Preserve the serializable export provenance separately.
-        url = h.get_download_url(image, dict(parameters))
+        if url_state is None:
+            url_state = {}
+        if 'url' not in url_state:
+            url_state['url'] = h.get_download_url(image, dict(parameters))
+        url = url_state['url']
         stage = 'qa-tiff-transfer'
         with session.get(url, stream=True, timeout=(30, 180)) as response:
             check_response(response)
@@ -328,7 +333,7 @@ def _download_chunk_once(image, tile, path, crs, session, contract, check):
                 for chunk in response.iter_content(256 * 1024):
                     check()
                     size += len(chunk)
-                    if size > 4 * 1024 * 1024:
+                    if size > max(4 * 1024 * 1024, tile.width * tile.height + 1024 * 1024):
                         raise ValueError('Unexpected oversized QA chunk')
                     stream.write(chunk)
         stage = 'qa-local-validation'
@@ -349,6 +354,136 @@ def _download_chunk_once(image, tile, path, crs, session, contract, check):
         raise
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def qa_transfer_groups(tiles):
+    """Pack missing adjacent windows into rectangles, at most 4096 x 4096.
+
+    Never request holes or already cached windows. Integer row/column offsets
+    preserve the original 30 m pixel lattice, including short boundary windows.
+    """
+    pending = {(t.row, t.col): t for t in tiles}
+    if len(pending) != len(tiles):
+        raise ValueError('Duplicate QA windows')
+    while pending:
+        first = pending[min(pending)]
+        members = [first]
+        while True:
+            last = members[-1]
+            right = pending.get((first.row, last.col + last.width))
+            if not (right and right.height == first.height and right.col + right.width - first.col <= 4096):
+                break
+            members.append(right)
+        row_members = list(members)
+        next_row = first.row + first.height
+        while True:
+            below = [pending.get((next_row, t.col)) for t in row_members]
+            if not (all(below) and len({t.height for t in below}) == 1 and
+                    next_row + below[0].height - first.row <= 4096 and
+                    all(top.width == bottom.width for top, bottom in zip(row_members, below))):
+                break
+            members.extend(below)
+            next_row += below[0].height
+        width = max(t.col + t.width for t in members) - first.col
+        height = max(t.row + t.height for t in members) - first.row
+        batch = h.Tile(first.row, first.col, first.left, first.top, width, height)
+        for t in members:
+            if (t.width > 768 or t.height > 768 or min(t.width, t.height) <= 0 or
+                    t.left != first.left + (t.col - first.col) * 30 or
+                    t.top != first.top - (t.row - first.row) * 30):
+                raise ValueError('QA windows do not share the exact 30 m lattice')
+            del pending[(t.row, t.col)]
+        yield batch, members
+
+
+def split_qa_batch(batch_path, batch, members, contracts, chunk_root, crs, check):
+    """Commit byte-exact uint8 windows with original contracts and provenance."""
+    inspect_qa(batch_path, batch.width, batch.height, Affine(*batch.transform), crs)
+    batch_sha = h.file_hash(batch_path)
+    with rasterio.open(batch_path) as source:
+        for tile in members:
+            check()
+            path = chunk_root / tile.name
+            contract = contracts[tile.name]
+            if cached(path, contract):
+                inspect_qa(path, tile.width, tile.height, Affine(*tile.transform), crs)
+                continue
+            window = Window(tile.col - batch.col, tile.row - batch.row, tile.width, tile.height)
+            values = source.read(1, window=window)
+            if values.shape != (tile.height, tile.width):
+                raise ValueError('QA batch window shape mismatch')
+            temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.part')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with rasterio.open(temporary, 'w', driver='GTiff', width=tile.width, height=tile.height,
+                        count=1, dtype='uint8', crs=crs, transform=Affine(*tile.transform), nodata=255,
+                        compress='deflate', tiled=True, blockxsize=256, blockysize=256) as dst:
+                    dst.write(values, 1)
+                inspect_qa(temporary, tile.width, tile.height, Affine(*tile.transform), crs)
+                with rasterio.open(temporary) as dst:
+                    if not np.array_equal(dst.read(1), values):
+                        raise ValueError('QA batch window readback mismatch')
+                check()
+                os.replace(temporary, path)
+                m.atomic_json(path.with_suffix('.json'), {
+                    'contract': contract, 'sha256': h.file_hash(path), 'downloaded_utc': now(),
+                    'derived_from': {'method': 'exact-grid-window-v1', 'path': str(batch_path),
+                        'sha256': batch_sha, 'window': [int(window.col_off), int(window.row_off),
+                                                       tile.width, tile.height]},
+                })
+            finally:
+                temporary.unlink(missing_ok=True)
+
+
+def download_qa_day(image, tiles, root, product, date, crs, session, day_contract,
+                    ee_version, check, report, batch_transfers=False):
+    chunk_root = root / 'chunks' / product / date
+    contracts = {t.name: {**day_contract, 'tile': t.name, 'ee_version': ee_version} for t in tiles}
+    missing = []
+    for tile in tiles:
+        check()
+        path = chunk_root / tile.name
+        if cached(path, contracts[tile.name]):
+            inspect_qa(path, tile.width, tile.height, Affine(*tile.transform), crs)
+        else:
+            missing.append(tile)
+    if batch_transfers and missing:
+        # A stop during local splitting must not discard a validated transfer.
+        by_name = {t.name: t for t in tiles}
+        batch_root = root / 'transfer_batches' / product / date
+        for receipt in sorted(batch_root.glob('*.json')):
+            saved = m.read_json(receipt)
+            batch_contract = saved.get('contract', {})
+            members = batch_contract.get('members', [])
+            names = [c.get('tile') for c in members if isinstance(c, dict)]
+            if (batch_contract.get('method') != 'adjacent-qa-windows-v1' or not names or
+                    len(names) != len(members) or len(set(names)) != len(names) or
+                    any(c != contracts.get(n) for n, c in zip(names, members)) or
+                    not any(t.name in names for t in missing)):
+                continue
+            groups = list(qa_transfer_groups([by_name[n] for n in names]))
+            if len(groups) != 1:
+                raise ValueError('Cached QA batch is not one adjacent rectangle')
+            batch, member_tiles = groups[0]
+            batch_path = receipt.with_suffix('.tif')
+            if not cached(batch_path, batch_contract):
+                raise ValueError('Cached QA batch is missing')
+            split_qa_batch(batch_path, batch, member_tiles, contracts, chunk_root, crs, check)
+            missing = [t for t in missing if t.name not in names]
+    groups = qa_transfer_groups(missing) if batch_transfers else ((t, [t]) for t in missing)
+    for batch, members in groups:
+        if len(members) == 1:
+            tile = members[0]
+            download_chunk(image, tile, chunk_root / tile.name, crs, session,
+                           contracts[tile.name], check, report)
+        else:
+            batch_contract = {'method': 'adjacent-qa-windows-v1',
+                              'members': [contracts[t.name] for t in members]}
+            # Different partial-cache groupings cannot collide with one another.
+            batch_path = root / 'transfer_batches' / product / date / (h.hash_object(batch_contract) + '.tif')
+            download_chunk(image, batch, batch_path, crs, session, batch_contract, check, report)
+            split_qa_batch(batch_path, batch, members, contracts, chunk_root, crs, check)
+    return [(tile, chunk_root / tile.name) for tile in tiles]
 
 
 def assemble_day(path, chunks, roi, crs, grid, contract, check):
@@ -402,7 +537,7 @@ def verify_mask(path, history_sha):
         raise ValueError('Static mask is not bound to the complete region history')
 
 
-def prepare_history(region, config, paths, check, progress):
+def prepare_history(region, config, paths, check, progress, *, batch_transfers=False):
     roi, crs, tiles, scenes, sources, grid = collect_region(region, paths['source_root'])
     contract = {'policy': POLICY, 'region': region.code, 'sources': sources,
                 'inventory_sha256': h.file_hash(paths['inventory']), 'crs': str(crs),
@@ -430,14 +565,10 @@ def prepare_history(region, config, paths, check, progress):
                     ee = h.initialize_ee(project, proxy)
                     ee.data.setDeadline(60000)
                 image = original_daily_qa(ee, members)
-                chunks = []
-                for tile in tiles:
-                    chunk = root / 'chunks' / product / date / tile.name
-                    download_chunk(image, tile, chunk, crs, session,
-                                   {**day_contract, 'tile': tile.name, 'ee_version': ee.__version__}, check,
-                                   report=lambda **detail:progress('qa-transfer-retry',region=region.code,
-                                       date=date,product=product,**detail))
-                    chunks.append((tile, chunk))
+                chunks = download_qa_day(image, tiles, root, product, date, crs, session,
+                    day_contract, ee.__version__, check,
+                    report=lambda **detail:progress('qa-transfer-retry', region=region.code,
+                        date=date, product=product, **detail), batch_transfers=batch_transfers)
                 assemble_day(path, chunks, roi, crs, grid, day_contract, check)
             observations.append({'date': date, 'product': product, 'path': str(path), 'sha256': h.file_hash(path)})
             progress('original-qa', region=region.code, completed_days=number, total_days=len(grouped))
@@ -462,7 +593,7 @@ def prepare_history(region, config, paths, check, progress):
     return mask, history_sha
 
 
-def run_cycle(config, paths, check, progress):
+def run_cycle(config, paths, check, progress, *, qa_batch_regions=()):
     inventory_sha = h.file_hash(paths['inventory'])
     exclusions=exclusion_keys(config)
     inventory = a.read_inventory(str(paths['inventory']))
@@ -490,7 +621,8 @@ def run_cycle(config, paths, check, progress):
                 results[region.code] = {'phase': 'waiting-for-region-download', 'waiting_for': waiting}
                 continue
             progress('region-download-verified', region=region.code)
-            mask, history_sha = prepare_history(region, config, paths, check, progress)
+            mask, history_sha = prepare_history(region, config, paths, check, progress,
+                batch_transfers=region.code in qa_batch_regions)
             if h.file_hash(paths['inventory']) != inventory_sha:
                 raise ValueError('Frozen inventory changed')
             state = paths['state_root'] / region.code / 'daily'
@@ -534,9 +666,14 @@ def main(argv=None):
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--once', action='store_true')
+    parser.add_argument('--qa-batch-region', action='append', default=[], metavar='CODE',
+                        help='Opt in this region to serial adjacent-window QA transfers')
     args = parser.parse_args(argv)
     config = m.read_json(args.config)
     paths = validate_config(config)
+    known_regions = {r.code for r in a.read_inventory(str(paths['inventory'])).regions}
+    if not set(args.qa_batch_region) <= known_regions:
+        parser.error('Unknown QA batch region')
     if not args.run:
         print(json.dumps({'mode': 'plan', 'policy': POLICY, 'trigger': 'each complete verified region',
                           'output_root': str(paths['output_root'])})); return 0
@@ -561,7 +698,7 @@ def main(argv=None):
         while not stopped.is_set():
             try:
                 check()
-                results = run_cycle(config, paths, check, progress)
+                results = run_cycle(config, paths, check, progress, qa_batch_regions=args.qa_batch_region)
                 if all(row['phase'] == 'completed' for row in results.values()): return 0
             except InterruptedError:
                 return 0

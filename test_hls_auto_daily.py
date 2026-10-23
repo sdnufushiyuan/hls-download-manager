@@ -18,6 +18,166 @@ from urllib3.exceptions import MaxRetryError, SSLError as UrllibSSLError
 
 
 class AutoDailyTests(unittest.TestCase):
+    def test_adjacent_groups_cover_only_missing_windows_and_short_edges(self):
+        tiles = [h.Tile(r,c,300+c*30,600-r*30,w,ht)
+                 for r,ht in [(0,768),(768,77)] for c,w in [(0,768),(768,33)]]
+        groups = list(auto.qa_transfer_groups(tiles))
+        self.assertEqual(len(groups),1)
+        batch,members = groups[0]
+        self.assertEqual((batch.width,batch.height),(801,845))
+        self.assertEqual(members,tiles)
+        groups = list(auto.qa_transfer_groups([tiles[0],tiles[3]]))
+        self.assertTrue(all(len(members)==1 for _,members in groups))
+        bad = h.Tile(0,768,23400,600,33,768)
+        with self.assertRaises(ValueError):list(auto.qa_transfer_groups([tiles[0],bad]))
+        with self.assertRaises(ValueError):list(auto.qa_transfer_groups([tiles[0],tiles[0]]))
+
+    def test_batch_limit_and_fresh_region_request_counts(self):
+        for width,height,expected in [(2001,2001,9),(2860,3584,20)]:
+            tiles=[h.Tile(r,c,300+c*30,600-r*30,min(768,width-c),min(768,height-r))
+                for r in range(0,height,768) for c in range(0,width,768)]
+            self.assertEqual(len(tiles),expected)
+            groups=list(auto.qa_transfer_groups(tiles));self.assertEqual(len(groups),1)
+            batch,members=groups[0]
+            self.assertEqual((batch.width,batch.height),(width,height))
+            self.assertEqual(sum(t.width*t.height for t in members),width*height)
+        tiles=[h.Tile(r,c,c*30,600-r*30,768,768) for r in range(0,4608,768) for c in range(0,4608,768)]
+        groups=list(auto.qa_transfer_groups(tiles))
+        self.assertEqual(len(groups),4)
+        self.assertTrue(all(batch.width<=4096 and batch.height<=4096 for batch,_ in groups))
+        self.assertEqual(sum(len(members) for _,members in groups),len(tiles))
+
+    def test_batch_pixels_daily_output_and_original_contracts_equal_serial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);tiles=[h.Tile(r,c,c*30,120-r*30,w,ht)
+                for r,ht in [(0,3),(3,1)] for c,w in [(0,3),(3,2)]]
+            calls=[]
+            def transfer(image,tile,path,crs,session,contract,check,report=None):
+                calls.append(tile)
+                rows=np.arange(tile.row,tile.row+tile.height)[:,None]
+                cols=np.arange(tile.col,tile.col+tile.width)[None,:]
+                values=np.array([64,96,66,255],dtype='uint8')[(rows+cols)%4]
+                path.parent.mkdir(parents=True,exist_ok=True)
+                with rasterio.open(path,'w',driver='GTiff',width=tile.width,height=tile.height,
+                        count=1,dtype='uint8',crs=crs,transform=Affine(*tile.transform),nodata=255,
+                        compress='deflate',tiled=True,blockxsize=256,blockysize=256) as ds:ds.write(values,1)
+                auto.m.atomic_json(path.with_suffix('.json'),{'contract':contract,'sha256':h.file_hash(path)})
+            with patch.object(auto,'download_chunk',side_effect=transfer):
+                serial=auto.download_qa_day(None,tiles,root/'serial','S30','20200101','EPSG:32614',None,
+                    {'fixed':'contract'},'test',lambda:None,Mock())
+                self.assertEqual(len(calls),4);calls.clear()
+                batched=auto.download_qa_day(None,tiles,root/'batch','S30','20200101','EPSG:32614',None,
+                    {'fixed':'contract'},'test',lambda:None,Mock(),True)
+                self.assertEqual(len(calls),1)
+            for (t,left),(_,right) in zip(serial,batched):
+                self.assertEqual(h.file_hash(left),h.file_hash(right))
+                one=auto.m.read_json(left.with_suffix('.json'));two=auto.m.read_json(right.with_suffix('.json'))
+                self.assertEqual(one['contract'],two['contract'])
+                self.assertTrue(auto.cached(right,one['contract']))
+                self.assertEqual(two['derived_from']['method'],'exact-grid-window-v1')
+            grid=(5,4,Affine(30,0,0,0,-30,120),0,0)
+            for name,chunks in [('serial',serial),('batch',batched)]:
+                auto.assemble_day(root/(name+'.tif'),chunks,box(0,0,150,120),'EPSG:32614',grid,{},lambda:None)
+            self.assertEqual(h.file_hash(root/'serial.tif'),h.file_hash(root/'batch.tif'))
+            # A restart reuses every committed window, with no network calls or rewrites.
+            hashes={p:h.file_hash(p) for _,p in batched}
+            mtimes={p:p.stat().st_mtime_ns for p in hashes}
+            with patch.object(auto,'download_chunk') as transfer:
+                auto.download_qa_day(None,tiles,root/'batch','S30','20200101','EPSG:32614',None,
+                    {'fixed':'contract'},'test',lambda:None,Mock(),True)
+            transfer.assert_not_called()
+            self.assertEqual(hashes,{p:h.file_hash(p) for p in hashes})
+            self.assertEqual(mtimes,{p:p.stat().st_mtime_ns for p in hashes})
+
+    def test_partial_cache_excluded_from_new_transfers_and_bad_cache_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);tiles=[h.Tile(0,c,c*30,30,1,1) for c in range(3)]
+            chunk=root/'chunks/L30/20200101'/tiles[0].name;chunk.parent.mkdir(parents=True)
+            with rasterio.open(chunk,'w',driver='GTiff',width=1,height=1,count=1,dtype='uint8',
+                    crs='EPSG:32614',transform=Affine(*tiles[0].transform)) as ds:
+                ds.write(np.array([[96]],dtype='uint8'),1)
+            contract={'date':'20200101','tile':tiles[0].name,'ee_version':'test'}
+            auto.m.atomic_json(chunk.with_suffix('.json'),{'contract':contract,'sha256':h.file_hash(chunk)})
+            before=(h.file_hash(chunk),chunk.stat().st_mtime_ns)
+            with patch.object(auto,'download_chunk',side_effect=InterruptedError()) as transfer:
+                with self.assertRaises(InterruptedError):
+                    auto.download_qa_day(None,tiles,root,'L30','20200101','EPSG:32614',None,
+                        {'date':'20200101'},'test',lambda:None,Mock(),True)
+            batch=transfer.call_args.args[1]
+            self.assertEqual((batch.col,batch.width),(1,2))
+            self.assertEqual(before,(h.file_hash(chunk),chunk.stat().st_mtime_ns))
+            chunk.write_bytes(b'corrupted')
+            with patch.object(auto,'download_chunk') as transfer:
+                with self.assertRaises(ValueError):
+                    auto.download_qa_day(None,tiles,root,'L30','20200101','EPSG:32614',None,
+                        {'date':'20200101'},'test',lambda:None,Mock(),True)
+            transfer.assert_not_called()
+
+    def test_interrupted_split_reuses_completed_batch_without_new_network(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);tiles=[h.Tile(r,c,c*30,60-r*30,1,1) for r in range(2) for c in range(2)]
+            def transfer(image,tile,path,crs,session,contract,check,report=None):
+                path.parent.mkdir(parents=True,exist_ok=True)
+                with rasterio.open(path,'w',driver='GTiff',width=2,height=2,count=1,dtype='uint8',
+                        crs=crs,transform=Affine(*tile.transform)) as ds:
+                    ds.write(np.array([[96,64],[255,66]],dtype='uint8'),1)
+                auto.m.atomic_json(path.with_suffix('.json'),{'contract':contract,'sha256':h.file_hash(path)})
+            split=auto.split_qa_batch
+            def interrupted(*args):
+                visits=[0]
+                def check():
+                    visits[0]+=1
+                    if visits[0]==3:raise InterruptedError()
+                return split(*args[:-1],check)
+            with patch.object(auto,'download_chunk',side_effect=transfer), \
+                    patch.object(auto,'split_qa_batch',side_effect=interrupted):
+                with self.assertRaises(InterruptedError):
+                    auto.download_qa_day(None,tiles,root,'L30','20200101','EPSG:32614',None,{},'test',lambda:None,Mock(),True)
+            existing=root/'chunks/L30/20200101'/tiles[0].name
+            before=(h.file_hash(existing),existing.stat().st_mtime_ns)
+            self.assertEqual(len(list((root/'chunks').rglob('*.tif'))),1)
+            with patch.object(auto,'download_chunk') as transfer:
+                chunks=auto.download_qa_day(None,tiles,root,'L30','20200101','EPSG:32614',None,{},'test',lambda:None,Mock(),True)
+            transfer.assert_not_called()
+            self.assertEqual(len(chunks),4)
+            self.assertEqual(before,(h.file_hash(existing),existing.stat().st_mtime_ns))
+            self.assertFalse(list(root.rglob('*.part')))
+
+    def test_tiff_429_reuses_url_and_keeps_retry_after_and_finite_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);tile=h.Tile(0,0,0,30,1,1);source=root/'source.tif'
+            with rasterio.open(source,'w',driver='GTiff',width=1,height=1,count=1,dtype='uint8',
+                    crs='EPSG:32614',transform=Affine(*tile.transform)) as ds:
+                ds.write(np.array([[96]],dtype='uint8'),1)
+            first=Mock(status_code=429,headers={'Retry-After':'42'})
+            first.iter_content.return_value=[b'{"error":{"status":"RESOURCE_EXHAUSTED"}}']
+            second=Mock(status_code=200);second.iter_content.return_value=[source.read_bytes()]
+            contexts=[]
+            for response in [first,second]:
+                ctx=Mock();ctx.__enter__=Mock(return_value=response);ctx.__exit__=Mock(return_value=False);contexts.append(ctx)
+            session=Mock();session.get.side_effect=contexts
+            with patch.object(h,'get_download_url',return_value='https://example.org/?token=private') as urls, \
+                    patch.object(auto,'retry_wait') as wait:
+                auto.download_chunk(None,tile,root/'qa.tif','EPSG:32614',session,{},lambda:None,Mock())
+            urls.assert_called_once();wait.assert_called_once()
+            self.assertEqual(wait.call_args.args[0],42)
+            self.assertEqual(session.get.call_args_list[0],session.get.call_args_list[1])
+            self.assertNotIn('private',(root/'qa.json').read_text())
+
+    def test_batch_opt_in_does_not_change_other_region_or_configuration(self):
+        regions=[Mock(code=code,area_m2=n) for n,code in enumerate(['SMALL','MEDIUM','LARGE'])]
+        inventory=Mock(regions=regions)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);source=root/'inventory.json';source.write_text('{}')
+            paths=dict(inventory=source,source_root=root/'archive',state_root=root/'state')
+            config={'nas_source':'//nas/data'};before=json.dumps(config,sort_keys=True)
+            with patch.object(auto.a,'read_inventory',return_value=inventory), \
+                    patch.object(auto,'region_ready',return_value=(True,None)), \
+                    patch.object(auto,'prepare_history',side_effect=ValueError('stop before network')) as prepare:
+                auto.run_cycle(config,paths,lambda:None,Mock(),qa_batch_regions=['SMALL','MEDIUM'])
+            self.assertEqual([c.kwargs['batch_transfers'] for c in prepare.call_args_list],[True,True,False])
+            self.assertEqual(json.dumps(config,sort_keys=True),before)
+
     def wrapped_ssl(self, inner):
         return requests.exceptions.SSLError(MaxRetryError(
             None, 'https://example.org/?token=must-not-be-logged', reason=UrllibSSLError(inner)))

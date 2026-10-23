@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Opt selected QA regions into serial adjacent-window transfers with exact-grid splitting and resumable batch provenance; preserve existing checkpoints and reuse in-memory download URLs during bounded TIFF retries, reducing redundant EE requests without adding download workers.
+
 - Diagnose QA TLS failures by request stage and bounded exception codes; retry explicit transient TLS failures with fresh process-local connections while preserving certificate verification, checkpoint contracts and finite retry limits.
 
 - Preserve storage-recovery exceptions through the tile pool; log safe HTTP categories and apply bounded retries to explicitly identified EE compute failures while retaining terminal input/authentication protections.
