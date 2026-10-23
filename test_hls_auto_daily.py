@@ -3,6 +3,7 @@ from pathlib import Path
 import tempfile
 import json
 import os
+import ssl
 import unittest
 from unittest.mock import Mock, patch
 import numpy as np
@@ -12,9 +13,108 @@ from shapely.geometry import box
 import hls_auto_daily as auto
 import download_hls_optram as h
 import run_hls_archive as archive
+import requests
+from urllib3.exceptions import MaxRetryError, SSLError as UrllibSSLError
 
 
 class AutoDailyTests(unittest.TestCase):
+    def wrapped_ssl(self, inner):
+        return requests.exceptions.SSLError(MaxRetryError(
+            None, 'https://example.org/?token=must-not-be-logged', reason=UrllibSSLError(inner)))
+
+    def test_tls_diagnostics_walk_wrapped_errors_without_disclosing_messages(self):
+        error = self.wrapped_ssl(ssl.SSLEOFError(8, 'signed-url-and-token-secret'))
+        error._hls_qa_stage = 'qa-tiff-transfer'
+        detail = auto.safe_error(error)
+        self.assertEqual(detail['category'], 'tls-eof')
+        self.assertEqual(detail['stage'], 'qa-tiff-transfer')
+        self.assertTrue(auto.qa_transient(error))
+        self.assertNotIn('secret', json.dumps(detail))
+        self.assertNotIn('token', json.dumps(detail))
+        self.assertNotIn('example.org', json.dumps(detail))
+        error._hls_qa_stage = 'https://example.org/private'
+        self.assertNotIn('stage', auto.safe_error(error))
+
+    def test_wrapped_certificate_failure_is_terminal_without_reset(self):
+        error = self.wrapped_ssl(ssl.SSLCertVerificationError(1, 'private certificate message'))
+        tile = h.Tile(0,0,0,30,1,1)
+        session = Mock()
+        with patch.object(auto, '_download_chunk_once', side_effect=error) as transfer, \
+                patch.object(auto, 'retry_wait') as wait:
+            with self.assertRaises(requests.exceptions.SSLError):
+                auto.download_chunk(None,tile,Path('/qa.tif'),'EPSG:32614',session,{},lambda:None)
+        self.assertEqual(transfer.call_count,1)
+        wait.assert_not_called();session.close.assert_not_called()
+        self.assertEqual(auto.safe_error(error)['category'],'tls-certificate')
+
+    def test_local_io_and_http_denial_cannot_inherit_tls_retry(self):
+        eof = ssl.SSLEOFError(8, 'private')
+        disk = OSError(28, 'disk full');disk.__context__ = eof
+        self.assertFalse(auto.qa_transient(disk))
+        self.assertNotIn('category',auto.tls_detail(disk))
+        response = requests.Response();response.status_code = 403
+        denied = requests.exceptions.HTTPError(response=response);denied.__context__ = eof
+        self.assertFalse(auto.qa_transient(denied))
+
+    def test_native_tls_eof_gets_bounded_retry_and_ee_socket_reset(self):
+        tile = h.Tile(0,0,0,30,1,1)
+        error = ssl.SSLEOFError(8, 'private');error._hls_qa_stage = 'ee-get-download-url'
+        connection = Mock();transport = Mock(connections={'host': connection})
+        credentials = transport.credentials
+        from ee import _state
+        with patch.object(auto, '_download_chunk_once', side_effect=[error,None]) as transfer, \
+                patch.object(auto, 'retry_wait'), \
+                patch.object(_state,'get_state',return_value=Mock(http_transport=transport)):
+            auto.download_chunk(None,tile,Path('/qa.tif'),'EPSG:32614',Mock(),{},lambda:None,Mock())
+        self.assertEqual(transfer.call_count,2);connection.close.assert_called_once()
+        self.assertEqual(transport.connections,{})
+        self.assertIs(transport.credentials,credentials);transport.close.assert_not_called()
+
+    def test_native_protocol_eof_is_retried_but_unknown_ssl_is_not(self):
+        error=ssl.SSLError(1,'private protocol message')
+        error.reason='UNEXPECTED_EOF_WHILE_READING'
+        self.assertTrue(auto.qa_transient(error))
+        self.assertEqual(auto.safe_error(error)['tls_reason'],'UNEXPECTED_EOF_WHILE_READING')
+        unknown=ssl.SSLError(1,'private unknown message')
+        self.assertFalse(auto.qa_transient(unknown))
+
+    def test_eof_midstream_cleans_partial_and_retries_same_pixel_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);tile=h.Tile(0,0,0,30,1,1);source=root/'source.tif'
+            with rasterio.open(source,'w',driver='GTiff',width=1,height=1,count=1,dtype='uint8',
+                    crs='EPSG:32614',transform=Affine(*tile.transform)) as ds:
+                ds.write(np.array([[96]],dtype='uint8'),1)
+            payload=source.read_bytes();error=self.wrapped_ssl(ssl.SSLEOFError(8,'private'))
+            def interrupted(*args):
+                yield payload[:20]
+                raise error
+            first=Mock(status_code=200);first.iter_content.side_effect=interrupted
+            second=Mock(status_code=200);second.iter_content.return_value=[payload]
+            contexts=[]
+            for response in [first,second]:
+                ctx=Mock();ctx.__enter__=Mock(return_value=response);ctx.__exit__=Mock(return_value=False);contexts.append(ctx)
+            session=Mock();session.get.side_effect=contexts
+            output=root/'qa.tif';reports=Mock()
+            with patch.object(h,'get_download_url',return_value='https://example.org/?token=secret'), \
+                    patch.object(auto,'retry_wait'):
+                auto.download_chunk(None,tile,output,'EPSG:32614',session,{'fixed':'contract'},lambda:None,reports)
+            session.close.assert_called_once()
+            self.assertEqual(session.get.call_count,2)
+            self.assertEqual(reports.call_args.kwargs['stage'],'qa-tiff-transfer')
+            self.assertEqual(reports.call_args.kwargs['category'],'tls-eof')
+            self.assertTrue(reports.call_args.kwargs['connection_reset'])
+            self.assertTrue(auto.cached(output,{'fixed':'contract'}))
+            self.assertFalse(list(root.glob('*.part')))
+            with rasterio.open(output) as ds:np.testing.assert_array_equal(ds.read(1),[[96]])
+
+    def test_tls_retry_exhaustion_is_finite_and_keeps_safe_context(self):
+        error=self.wrapped_ssl(ssl.SSLEOFError(8,'private'));error._hls_qa_stage='qa-tiff-transfer'
+        with patch.object(auto,'_download_chunk_once',side_effect=error) as transfer, \
+                patch.object(auto,'retry_wait') as wait:
+            with self.assertRaises(requests.exceptions.SSLError):
+                auto.download_chunk(None,h.Tile(0,0,0,30,1,1),Path('/qa.tif'),'EPSG:32614',Mock(),{},lambda:None,Mock())
+        self.assertEqual(transfer.call_count,4);self.assertEqual(wait.call_count,3)
+
     def test_proxy_is_explicit_for_both_schemes_even_with_no_proxy_environment(self):
         with patch.dict(os.environ,{'NO_PROXY':'*','HTTPS_PROXY':'http://example.org:9'}):
             with auto.qa_session('http://127.0.0.1:8118') as session:

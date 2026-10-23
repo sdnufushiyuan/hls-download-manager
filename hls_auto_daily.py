@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -169,11 +170,111 @@ def check_response(response):
     raise QAHTTPError(response.status_code,category,delay)
 
 
+TLS_REASONS = frozenset({
+    'CERTIFICATE_VERIFY_FAILED', 'UNEXPECTED_EOF_WHILE_READING',
+    'DECRYPTION_FAILED_OR_BAD_RECORD_MAC', 'SSLV3_ALERT_BAD_RECORD_MAC',
+    'TLSV1_ALERT_INTERNAL_ERROR', 'SSLV3_ALERT_INTERNAL_ERROR',
+})
+QA_STAGES = frozenset({'ee-get-download-url', 'qa-tiff-transfer', 'qa-local-validation'})
+
+
+def error_chain(error):
+    """Walk exception objects only; messages/URLs are never retained or logged."""
+    pending, seen = [error], set()
+    while pending and len(seen) < 16:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.extend(child for child in (
+            getattr(current, '__cause__', None), getattr(current, '__context__', None),
+            getattr(current, 'reason', None), *getattr(current, 'args', ()),
+        ) if isinstance(child, BaseException))
+
+
+def tls_detail(error):
+    chain = list(error_chain(error))
+    # A local write/validation failure must not become a transport retry merely
+    # because an earlier SSL exception appears in its context.
+    if isinstance(error, OSError) and not isinstance(error, (ssl.SSLError, requests.exceptions.RequestException)):
+        return {}
+    tls = [e for e in chain if isinstance(e, (ssl.SSLError, requests.exceptions.SSLError))]
+    if not tls:
+        return {}
+    reasons = [getattr(e, 'reason', None) for e in tls]
+    certificate = any(isinstance(e, ssl.SSLCertVerificationError) for e in tls) or 'CERTIFICATE_VERIFY_FAILED' in reasons
+    reason = next((r for r in reasons if isinstance(r, str) and r in TLS_REASONS), None)
+    category = ('tls-certificate' if certificate else
+                'tls-eof' if any(isinstance(e, ssl.SSLEOFError) for e in tls) or reason == 'UNEXPECTED_EOF_WHILE_READING' else
+                'tls-protocol' if reason else 'tls-unknown')
+    result = {'category': category}
+    if reason:
+        result['tls_reason'] = reason
+    code = next((e.verify_code for e in tls if type(getattr(e, 'verify_code', None)) is int), None)
+    if code is not None:
+        result['tls_verify_code'] = code
+    return result
+
+
+def qa_transient(error):
+    if isinstance(error, QAHTTPError):
+        return (error.http_status in (408, 425, 429, 500, 502, 503, 504) or
+                (error.http_status == 400 and error.category == 'server-or-proxy-error'))
+    detail = tls_detail(error)
+    if detail.get('category') == 'tls-certificate':
+        return False
+    if detail.get('category') in ('tls-eof', 'tls-protocol'):
+        from google.auth.exceptions import RefreshError, DefaultCredentialsError
+        from googleapiclient.errors import HttpError
+        # Keep credential and explicit HTTP denials terminal even if their
+        # exception context also contains an earlier transport failure.
+        if any(isinstance(e, (requests.exceptions.HTTPError, h.DownloadError,
+                              RefreshError, DefaultCredentialsError, HttpError))
+               for e in error_chain(error)):
+            return h.is_transient_error(error)
+        return True
+    return h.is_transient_error(error)
+
+
+def reset_qa_connections(error, session):
+    """Discard failed sockets in this serial QA process, preserving credentials.
+
+    No shared proxy or archive process is touched. httplib2.Http.close() also
+    clears credentials/certificates, so close only its cached socket objects.
+    """
+    stage = getattr(error, '_hls_qa_stage', None)
+    if stage == 'qa-tiff-transfer':
+        try:
+            session.close()  # Requests keeps proxies, verification and adapters.
+            return True
+        except OSError:
+            return False
+    if stage == 'ee-get-download-url':
+        from ee import _state
+        transport = _state.get_state().http_transport
+        connections = getattr(transport, 'connections', None)
+        if isinstance(connections, dict):
+            existing = list(connections.values())
+            connections.clear()
+            for connection in existing:
+                try:
+                    connection.close()
+                except OSError:
+                    pass  # Already evicted; preserve the original error/retry.
+            return True
+    return False
+
+
 def safe_error(error):
     result={'error_type':type(error).__name__}
     if isinstance(error,QAHTTPError):result.update(http_status=error.http_status,category=error.category)
     elif isinstance(error,requests.exceptions.HTTPError) and error.response is not None:
         result['http_status']=error.response.status_code
+    result.update(tls_detail(error))
+    stage = getattr(error, '_hls_qa_stage', None)
+    if stage in QA_STAGES:
+        result['stage'] = stage
     return result
 
 
@@ -195,13 +296,11 @@ def download_chunk(image,tile,path,crs,session,contract,check,report=None):
         try:return _download_chunk_once(image,tile,path,crs,session,contract,check)
         except InterruptedError:raise
         except Exception as error:
-            if isinstance(error,QAHTTPError):
-                transient=(error.http_status in (408,425,429,500,502,503,504) or
-                           (error.http_status==400 and error.category=='server-or-proxy-error'))
-            else:transient=h.is_transient_error(error)
-            if not transient or attempt==len(delays):raise
+            if not qa_transient(error) or attempt==len(delays):raise
             delay=max(delays[attempt],getattr(error,'retry_after',0))
             detail={**safe_error(error),'tile':tile.name,'retry':attempt+1,'retry_limit':len(delays),'wait_seconds':delay}
+            if tls_detail(error):
+                detail['connection_reset'] = reset_qa_connections(error, session)
             if report:report(**detail)
             else:print(json.dumps({'phase':'qa-transfer-retry',**detail}),flush=True)
             retry_wait(delay,check)
@@ -215,11 +314,13 @@ def _download_chunk_once(image, tile, path, crs, session, contract, check):
     temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.part')
     parameters = {'crs': str(crs), 'crs_transform': tile.transform,
                   'dimensions': [tile.width, tile.height], 'format': 'GEO_TIFF'}
+    stage = 'ee-get-download-url'
     try:
         check()
         # EE's getDownloadURL mutates its params dict by adding an Image object.
         # Preserve the serializable export provenance separately.
         url = h.get_download_url(image, dict(parameters))
+        stage = 'qa-tiff-transfer'
         with session.get(url, stream=True, timeout=(30, 180)) as response:
             check_response(response)
             size = 0
@@ -230,6 +331,7 @@ def _download_chunk_once(image, tile, path, crs, session, contract, check):
                     if size > 4 * 1024 * 1024:
                         raise ValueError('Unexpected oversized QA chunk')
                     stream.write(chunk)
+        stage = 'qa-local-validation'
         inspect_qa(temporary, tile.width, tile.height, Affine(*tile.transform), crs)
         with rasterio.open(temporary) as ds:
             values = ds.read(1)
@@ -242,6 +344,9 @@ def _download_chunk_once(image, tile, path, crs, session, contract, check):
         os.replace(temporary, path)
         m.atomic_json(path.with_suffix('.json'), {'contract': contract, 'sha256': h.file_hash(path),
                       'export': parameters, 'downloaded_utc': now()})
+    except Exception as error:
+        error._hls_qa_stage = stage
+        raise
     finally:
         temporary.unlink(missing_ok=True)
 

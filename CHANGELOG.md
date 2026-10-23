@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Diagnose QA TLS failures by request stage and bounded exception codes; retry explicit transient TLS failures with fresh process-local connections while preserving certificate verification, checkpoint contracts and finite retry limits.
+
 - Preserve storage-recovery exceptions through the tile pool; log safe HTTP categories and apply bounded retries to explicitly identified EE compute failures while retaining terminal input/authentication protections.
 
 - Label active months with complete download hints as checkpoint verification/reuse; avoid presenting every active monthly process as fresh downloading.
